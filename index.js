@@ -1,31 +1,33 @@
-// index.js
+// index.js — Final robust random-team-bot
 'use strict';
 
 const { Telegraf, Markup } = require('telegraf');
 const express = require('express');
 const Redis = require('ioredis');
-const fetch = require('node-fetch');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const REDIS_URL = process.env.REDIS_URL; // e.g. redis://:password@host:port
-const USE_WEBHOOK = (process.env.USE_WEBHOOK || 'true').toLowerCase() === 'true';
-const WEBHOOK_URL = process.env.WEBHOOK_URL; // e.g. https://your-service.onrender.com/telegram-webhook
-const PORT = process.env.PORT || 3000;
+const REDIS_URL = process.env.REDIS_URL || '';
+const USE_WEBHOOK = (process.env.USE_WEBHOOK || 'false').toLowerCase() === 'true';
+const WEBHOOK_URL = process.env.WEBHOOK_URL || ''; // e.g. https://your-service.onrender.com/telegram-webhook
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 
 if (!BOT_TOKEN) {
-  console.error('Missing BOT_TOKEN env var');
+  console.error('ERROR: BOT_TOKEN environment variable is required.');
   process.exit(1);
 }
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// Redis client (simple)
+// ---------- Redis or in-memory fallback ----------
 let redis;
+let usingRedis = false;
 if (REDIS_URL) {
   redis = new Redis(REDIS_URL);
+  usingRedis = true;
+  redis.on('error', (e) => console.error('Redis error', e && e.message));
+  console.log('Using Redis at', REDIS_URL);
 } else {
-  console.warn('No REDIS_URL provided — sessions will be ephemeral (not recommended). Using in-memory fallback.');
-  // In-memory fallback (not persistent)
+  console.warn('Warning: REDIS_URL not provided. Using in-memory sessions (not persistent).');
   const mem = new Map();
   redis = {
     async get(k) { const v = mem.get(k); return v === undefined ? null : v; },
@@ -34,470 +36,428 @@ if (REDIS_URL) {
   };
 }
 
-// Utility: session key
-const sessionKey = (chatId) => `session:${chatId}`;
+// ---------- Session helpers ----------
+const SESSION_PREFIX = 'rtb:sess:';
+const sessionKey = (chatId) => `${SESSION_PREFIX}${chatId}`;
 
-// Helper: read session
 async function loadSession(chatId) {
   const raw = await redis.get(sessionKey(chatId));
   if (!raw) return null;
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    console.error('Failed parse session', e);
-    return null;
-  }
+  try { return JSON.parse(raw); } catch (e) { console.error('parse session error', e); return null; }
 }
-
-// Helper: save session
 async function saveSession(chatId, sess) {
   await redis.set(sessionKey(chatId), JSON.stringify(sess));
 }
 
-// Helper: create new group session skeleton
-function createEmptyGroupSession(teamsCount) {
-  return {
-    type: 'group',
-    teamsCount: teamsCount,
-    teams: Array.from({length: teamsCount}, () => []), // arrays of {id,name,role}
-    membersMap: {}, // userId -> true
-    signupOpen: true,
-    message_id: null, // message to edit
-    creator: null // user id who started
-  };
-}
-
-// Utility: shuffle array
-function shuffle(arr) {
-  for (let i = arr.length - 1; i > 0; --i) {
+// ---------- Utilities ----------
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
+    [a[i], a[j]] = [a[j], a[i]];
   }
-  return arr;
+  return a;
+}
+function escapeHtml(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// Build inline keyboard for group session
-function buildGroupKeyboard() {
+// ---------- Session model (group) ----------
+/*
+group session:
+{
+  type:'group',
+  teamsCount: number,
+  teams: [ { members: [ {id,name,role} ], subs: [ {id,name,role} ] } ], // teamsCount entries
+  membersMap: { "<userId>": true }, // prevent double-register
+  signupOpen: true/false,
+  message_id: number|null,
+  creator: userId
+}
+*/
+function createEmptyGroupSession(teamsCount, creator) {
+  const teams = Array.from({ length: teamsCount }, () => ({ members: [], subs: [] }));
+  return { type: 'group', teamsCount, teams, membersMap: {}, signupOpen: true, message_id: null, creator: creator || null };
+}
+
+// ---------- Keyboard & message builders ----------
+function groupKeyboardReplyMarkup() {
+  // We'll always pass reply_markup object explicitly to edit/send
   return Markup.inlineKeyboard([
     [ Markup.button.callback('⚽ بازیکن', 'join:player'), Markup.button.callback('🥅 دروازه‌بان', 'join:gk') ],
     [ Markup.button.callback('🔀 قاطی‌کردن دوباره (فقط ادمین)', 'action:reshuffle') ]
-  ]);
+  ]).reply_markup;
 }
 
-// Build status text for teams (nicely formatted)
-function buildTeamsText(sess) {
-  let text = '🏆 وضعیت تیم‌ها (لایو)\n\n';
-  for (let i = 0; i < sess.teamsCount; ++i) {
+function buildGroupText(sess) {
+  let out = '<b>🏆 وضعیت تیم‌ها (لایو)</b>\n\n';
+  for (let i = 0; i < sess.teamsCount; i++) {
     const t = sess.teams[i];
-    text += `🔵 تیم ${i+1} — ${t.length} نفر\n`;
-    if (t.length) {
-      for (const p of t) {
-        const icon = p.role === 'gk' ? '🧤' : '⚽';
-        text += ` ${icon} ${escapeMarkdown(p.name)}\n`;
-      }
-    } else text += ' —\n';
-    text += '\n';
-  }
-  // substitutes: any members beyond 5 in a team should become substitutes — but we maintain that invariant on insert
-  const subs = [];
-  for (let i=0;i<sess.teamsCount;i++) {
-    // none here because insertion logic prevents >5
-  }
-  text += '🔄 تعویضی‌ها: —\n\n';
-  text += '📌 هر نفر فقط یک‌بار می‌تواند ثبت‌نام کند.\n';
-  text += '👑 فقط ادمین می‌تواند «🔀 قاطی‌کردن دوباره» را اجرا کند.';
-  return text;
-}
-
-function escapeMarkdown(s) {
-  if (!s) return '';
-  // Escape basic markdown chars for safe edit
-  return s.replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
-}
-
-// Assign player into a team (random with balancing)
-function assignPlayerToTeam(sess, userId, name) {
-  // Build array of eligible teams (len < 5)
-  const eligible = [];
-  let minLen = Infinity;
-  for (let i = 0; i < sess.teamsCount; ++i) {
-    const len = sess.teams[i].length;
-    if (len < 5) {
-      if (len < minLen) {
-        minLen = len;
+    const color = ['🔵','🟢','🟠','🟣'][i % 4];
+    out += `${color} <b>تیم ${i+1}</b> — ${t.members.length} نفر\n`;
+    if (t.members.length === 0) out += '—\n';
+    else {
+      for (const m of t.members) {
+        const icon = (m.role === 'gk') ? '🧤' : '⚽';
+        out += `${icon} ${escapeHtml(m.name)}\n`;
       }
     }
+    if (t.subs && t.subs.length) {
+      out += `\n🔄 <b>تعویضی‌های تیم ${i+1}:</b>\n`;
+      for (const s of t.subs) out += `↳ ${escapeHtml(s.name)}\n`;
+    }
+    out += '\n';
   }
-  for (let i = 0; i < sess.teamsCount; ++i) {
-    if (sess.teams[i].length === minLen && sess.teams[i].length < 5) eligible.push(i);
-  }
-  if (eligible.length === 0) return null;
-  const chosen = eligible[Math.floor(Math.random() * eligible.length)];
-  sess.teams[chosen].push({ id: userId, name: name, role: 'player' });
-  sess.membersMap[userId] = true;
-  return chosen;
+  out += '<b>📌 هر نفر فقط یک‌بار می‌تواند ثبت‌نام کند.</b>\n';
+  out += '<b>👑 فقط ادمین می‌تواند «🔀 قاطی‌کردن دوباره» را اجرا کند.</b>';
+  return out;
 }
 
-// Assign GK into a team (random among teams without GK)
+// ---------- Assignment rules ----------
+function assignPlayerToTeam(sess, userId, name) {
+  // prefer teams with minimal size (<5)
+  let minSize = Infinity;
+  for (let i = 0; i < sess.teamsCount; i++) {
+    const size = sess.teams[i].members.length;
+    if (size < minSize && size < 5) minSize = size;
+  }
+  const candidates = [];
+  for (let i = 0; i < sess.teamsCount; i++) {
+    if (sess.teams[i].members.length === minSize && sess.teams[i].members.length < 5) candidates.push(i);
+  }
+  if (candidates.length > 0) {
+    const pick = candidates[Math.floor(Math.random() * candidates.length)];
+    sess.teams[pick].members.push({ id: userId, name, role: 'player' });
+    sess.membersMap[String(userId)] = true;
+    return { placed: true, team: pick };
+  }
+  // all teams full (members >=5) — put into subs on team with smallest subs
+  let minSubs = Infinity; let chosen = 0;
+  for (let i = 0; i < sess.teamsCount; i++) {
+    const s = sess.teams[i].subs.length;
+    if (s < minSubs) { minSubs = s; chosen = i; }
+  }
+  sess.teams[chosen].subs.push({ id: userId, name, role: 'player' });
+  sess.membersMap[String(userId)] = true;
+  return { placed: false, team: chosen };
+}
+
 function assignGkToTeam(sess, userId, name) {
-  const withoutGk = [];
-  for (let i = 0; i < sess.teamsCount; ++i) {
-    const hasGK = sess.teams[i].some(p => p.role === 'gk');
-    if (!hasGK && sess.teams[i].length < 5) withoutGk.push(i);
+  // choose among teams without GK and with members <5
+  const available = [];
+  for (let i = 0; i < sess.teamsCount; i++) {
+    const hasGK = sess.teams[i].members.some(m => m.role === 'gk');
+    if (!hasGK && sess.teams[i].members.length < 5) available.push(i);
   }
-  if (withoutGk.length === 0) return null;
-  const chosen = withoutGk[Math.floor(Math.random() * withoutGk.length)];
-  sess.teams[chosen].push({ id: userId, name: name, role: 'gk' });
-  sess.membersMap[userId] = true;
-  return chosen;
+  if (available.length === 0) return null;
+  const pick = available[Math.floor(Math.random() * available.length)];
+  sess.teams[pick].members.push({ id: userId, name, role: 'gk' });
+  sess.membersMap[String(userId)] = true;
+  return { team: pick };
 }
 
-// Re-shuffle session: take all members, separate GK and players, then randomly assign respecting rules
+// reshuffle: reassign all existing members (gk and players) randomly while respecting 1 GK per team and max 5 per team
 function reshuffleSession(sess) {
-  // gather gks and players
+  // collect all gks and players (including subs)
   const gks = [];
   const players = [];
-  for (let i = 0; i < sess.teamsCount; ++i) {
-    for (const p of sess.teams[i]) {
-      if (p.role === 'gk') gks.push({id: p.id, name: p.name});
-      else players.push({id: p.id, name: p.name});
+  for (let i = 0; i < sess.teamsCount; i++) {
+    for (const m of sess.teams[i].members) {
+      if (m.role === 'gk') gks.push({ id: m.id, name: m.name });
+      else players.push({ id: m.id, name: m.name });
     }
+    for (const s of sess.teams[i].subs) players.push({ id: s.id, name: s.name });
   }
-  // Must have exactly <= teamsCount gks (we only allow adding GK up to teamsCount)
-  // If not enough gks — reshuffle cannot create new GK — so keep current distribution and return false if fail
-  if (gks.length < sess.teamsCount) {
-    // can't reshuffle because not enough GK
-    return { ok: false, reason: 'not_enough_gk' };
-  }
-  // shuffle arrays
+  if (gks.length < sess.teamsCount) return { ok: false, reason: 'not_enough_gk' };
+
   shuffle(gks);
   shuffle(players);
-  // reset teams
-  sess.teams = Array.from({length: sess.teamsCount}, () => []);
-  // place one GK per team
-  for (let i=0;i<sess.teamsCount;i++) {
-    sess.teams[i].push({ id: gks[i].id, name: gks[i].name, role: 'gk' });
+
+  // create new empty teams
+  const newTeams = Array.from({ length: sess.teamsCount }, () => ({ members: [], subs: [] }));
+  // assign GK
+  for (let i = 0; i < sess.teamsCount; i++) {
+    newTeams[i].members.push({ id: gks[i].id, name: gks[i].name, role: 'gk' });
   }
-  // place players round-robin but keep max 5 per team (incl gk), extras go to substitutes list (we'll keep them but they will be assigned to subs)
-  const extras = [];
+  // assign players round-robin while respecting max 5
   let idx = 0;
-  for (const pl of players) {
+  for (const p of players) {
     const teamIdx = idx % sess.teamsCount;
-    if (sess.teams[teamIdx].length < 5) {
-      sess.teams[teamIdx].push({ id: pl.id, name: pl.name, role: 'player' });
+    if (newTeams[teamIdx].members.length < 5) {
+      newTeams[teamIdx].members.push({ id: p.id, name: p.name, role: 'player' });
     } else {
-      extras.push(pl);
+      newTeams[teamIdx].subs.push({ id: p.id, name: p.name, role: 'player' });
     }
     idx++;
   }
-  // extras: we'll append to 'subs' or leave as extras (here we append to a dedicated extras list inside session)
-  sess.extras = extras;
+
+  sess.teams = newTeams;
   return { ok: true };
 }
 
-// Update (edit) status message in group; if fails, send new message and save its id
-async function updateGroupStatusMessage(ctxBot, chatId, sess) {
-  const text = buildTeamsText(sess);
-  const keyboard = buildGroupKeyboard();
+// ---------- Message updater ----------
+async function updateGroupMessage(chatId, sess) {
+  const text = buildGroupText(sess);
+  const reply_markup = groupKeyboardReplyMarkup();
   try {
     if (sess.message_id) {
-      await ctxBot.telegram.editMessageText(chatId, sess.message_id, null, text, { parse_mode: 'MarkdownV2', ...keyboard });
+      await bot.telegram.editMessageText(chatId, sess.message_id, null, text, { parse_mode: 'HTML', reply_markup });
     } else {
-      const sent = await ctxBot.telegram.sendMessage(chatId, text, { parse_mode: 'MarkdownV2', ...keyboard });
+      const sent = await bot.telegram.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup });
       sess.message_id = sent.message_id;
     }
   } catch (err) {
-    console.error('Failed to edit message, sending new', err?.message || err);
-    const sent = await ctxBot.telegram.sendMessage(chatId, text, { parse_mode: 'MarkdownV2', ...keyboard });
+    console.error('updateGroupMessage failed (edit), sending new.', err && err.message);
+    const sent = await bot.telegram.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup });
     sess.message_id = sent.message_id;
   }
+  await saveSession(chatId, sess);
 }
 
+// ---------- Bot handlers ----------
 
-// --- Bot commands & handlers --- //
-
-// /start in private or group
+// /start
 bot.start(async (ctx) => {
   const chat = ctx.chat;
   if (chat.type === 'private') {
-    // show mode: inside bot or inside group
-    return ctx.reply('سلام! لطفاً انتخاب کن که می‌خوای تیم‌چینی داخل ربات باشه یا داخل گروه؟', Markup.inlineKeyboard([
+    await ctx.reply('سلام! کجا می‌خوای تیم‌چینی انجام بشه؟', Markup.inlineKeyboard([
       [ Markup.button.callback('🤖 داخل ربات', 'mode:inside_bot') ],
       [ Markup.button.callback('👥 داخل گروه', 'mode:inside_group') ]
     ]));
   } else {
-    // group: instruct to run /start_team (only admin should start)
-    return ctx.reply('برای شروع تیم‌چینی در گروه، ادمین دستور /start_team را اجرا کند.');
+    await ctx.reply('برای شروع تیم‌چینی ادمین گروه دستور /start_team را ارسال کند.');
   }
 });
 
-// /start_team command (group) — admin triggers
+// /start_team (group)
 bot.command('start_team', async (ctx) => {
-  const chat = ctx.chat;
-  if (chat.type === 'private') return ctx.reply('این دستور فقط در گروه اجرا می‌شود.');
-  // check admin
+  if (ctx.chat.type === 'private') return ctx.reply('این دستور فقط در گروه اجرا می‌شود.');
+  // only admins
   try {
     const admins = await ctx.getChatAdministrators();
     const isAdmin = admins.some(a => a.user.id === ctx.from.id);
-    if (!isAdmin) return ctx.reply('فقط ادمین گروه می‌تواند تیم‌چینی را آغاز کند.');
-  } catch (e) {
-    console.error('admin check failed', e);
-  }
-  // ask number of teams
+    if (!isAdmin) return ctx.reply('⛔ فقط ادمین می‌تواند این دستور را اجرا کند.');
+  } catch (e) { console.error('admin check error', e); }
   await ctx.reply('🔢 چند تیم می‌خواهی؟', Markup.inlineKeyboard([
-    [ Markup.button.callback('2️⃣  2 تیم', 'teams:2') ],
-    [ Markup.button.callback('3️⃣  3 تیم', 'teams:3') ],
+    [ Markup.button.callback('2️⃣  2 تیم', 'teams:2'), Markup.button.callback('3️⃣  3 تیم', 'teams:3') ],
     [ Markup.button.callback('4️⃣  4 تیم', 'teams:4') ]
   ]));
 });
 
-// Callback query handler
+// callback queries
 bot.on('callback_query', async (ctx) => {
-  const data = ctx.callbackQuery.data;
-  const chat = ctx.chat || (ctx.callbackQuery.message && ctx.callbackQuery.message.chat);
+  const data = ctx.callbackQuery && ctx.callbackQuery.data;
   const from = ctx.from;
+  const message = ctx.callbackQuery && ctx.callbackQuery.message;
   try {
-    // Mode selection from private
+    // mode selection in private
     if (data === 'mode:inside_bot') {
       await ctx.answerCbQuery();
-      return ctx.reply('در حالت داخل ربات، بعد از انتخاب تعداد تیم‌ها، نام‌ها را مستقیم در همین چت خصوصی بفرست.\n\n🔢 چند تیم می‌خواهی؟', Markup.inlineKeyboard([
+      return ctx.reply('در حالت داخل ربات — چند تیم؟', Markup.inlineKeyboard([
         [ Markup.button.callback('2️⃣  2 تیم', 'private:teams:2') ],
         [ Markup.button.callback('3️⃣  3 تیم', 'private:teams:3') ],
         [ Markup.button.callback('4️⃣  4 تیم', 'private:teams:4') ]
       ]));
     }
-
     if (data === 'mode:inside_group') {
       await ctx.answerCbQuery();
-      const botUser = (await bot.telegram.getMe()).username;
-      const addUrl = `https://t.me/${botUser}?startgroup=true`;
-      return ctx.replyWithHTML('برای اضافه کردن ربات به گروه خود، از لینک زیر استفاده کنید:\n' + `<a href="${addUrl}">اضافه کردن ربات به گروه</a>`);
+      const me = await bot.telegram.getMe();
+      const url = `https://t.me/${me.username}?startgroup=true`;
+      return ctx.replyWithHTML(`برای اضافه کردن ربات به گروه از لینک زیر استفاده کنید:\n<a href="${url}">اضافه کردن ربات به گروه</a>`);
     }
 
-    // private teams selection (after mode inside bot)
+    // private teams selection (user in private)
     if (data && data.startsWith('private:teams:')) {
       await ctx.answerCbQuery();
       const num = Number(data.split(':').pop());
-      // create a private session expecting names
       const sess = { type: 'private', teamsCount: num, awaitingNames: true, creator: from.id };
-      await saveSession(chat.id, sess);
-      return ctx.reply(`💡 لطفاً اسامی را در همین چت خصوصی ارسال کن.\n\nقواعد:\n- ابتدا دروازه‌بان‌ها (هر دروازه‌بان را در یک خط و با پیش‌نویس GK: یا فقط نام بنویس)\n- سپس یک خط خالی و بعد بازیکن‌ها (هر نام در یک خط)\n\nمثال:\nGK: Ali\nGK: Hassan\n\nSara\nReza\nMina\n...`);
+      await saveSession(ctx.chat.id, sess);
+      return ctx.reply(`<b>حالت داخل ربات — تعداد تیم‌ها: ${num}</b>\n\nلطفاً اسامی را هر کدام در یک خط ارسال کنید.\nتوضیح: <i>${num}</i> نام اول به عنوان دروازه‌بان در نظر گرفته می‌شود.`, { parse_mode: 'HTML' });
     }
 
     // group teams selection
     if (data && data.startsWith('teams:')) {
       await ctx.answerCbQuery();
       const num = Number(data.split(':').pop());
-      // group chat
-      const chatId = chat.id;
-      const sess = createEmptyGroupSession(num);
-      sess.creator = from.id;
+      const chatId = message.chat.id;
+      // only admins can choose number (protect)
+      try {
+        const admins = await bot.telegram.getChatAdministrators(chatId);
+        if (!admins.some(a => a.user.id === from.id)) {
+          return ctx.reply('⛔ فقط ادمین می‌تواند تعداد تیم‌ها را انتخاب کند.');
+        }
+      } catch (e) { console.error('admin check error', e); }
+      const sess = createEmptyGroupSession(num, from.id);
       await saveSession(chatId, sess);
-      // send initial status message with keyboard
-      await updateGroupStatusMessage(bot, chatId, sess);
-      await saveSession(chatId, sess);
+      await updateGroupMessage(chatId, sess);
       return;
     }
 
-    // Join player
+    // join player
     if (data === 'join:player') {
       await ctx.answerCbQuery();
-      const chatId = chat.id;
+      const chatId = message.chat.id;
       const sess = await loadSession(chatId);
-      if (!sess || !sess.signupOpen) return ctx.answerCbQuery('🔒 ثبت‌نام فعالی وجود ندارد.', { show_alert: true });
-      if (sess.membersMap && sess.membersMap[from.id]) return ctx.answerCbQuery('شما قبلاً ثبت‌نام کرده‌اید.', { show_alert: true });
-      // assign player
-      const name = from.username ? `@${from.username}` : (from.first_name || 'کاربر');
-      const teamIdx = assignPlayerToTeam(sess, from.id, name);
-      if (teamIdx === null) {
-        // all teams full
-        return ctx.answerCbQuery('همهٔ تیم‌ها پر هستند — شما در لیست تعویضی قرار می‌گیرید.', { show_alert: true });
-      }
+      if (!sess || !sess.signupOpen) return ctx.answerCbQuery('ثبت‌نام فعالی وجود ندارد.', { show_alert: true });
+      if (sess.membersMap && sess.membersMap[String(from.id)]) return ctx.answerCbQuery('شما قبلاً ثبت‌نام کرده‌اید.', { show_alert: true });
+      const name = from.username ? `@${from.username}` : (from.first_name || `${from.id}`);
+      const res = assignPlayerToTeam(sess, from.id, name);
       await saveSession(chatId, sess);
-      await updateGroupStatusMessage(bot, chatId, sess);
-      return ctx.answerCbQuery('✅ شما به عنوان بازیکن ثبت شدید.');
+      await updateGroupMessage(chatId, sess);
+      if (res.placed) return ctx.answerCbQuery(`✅ شما در تیم ${res.team + 1} ثبت شدید.`);
+      else return ctx.answerCbQuery(`✅ شما به تعویضی تیم ${res.team + 1} اضافه شدید.`);
     }
 
-    // Join GK
+    // join gk
     if (data === 'join:gk') {
       await ctx.answerCbQuery();
-      const chatId = chat.id;
+      const chatId = message.chat.id;
       const sess = await loadSession(chatId);
-      if (!sess || !sess.signupOpen) return ctx.answerCbQuery('🔒 ثبت‌نام فعالی وجود ندارد.', { show_alert: true });
-      if (sess.membersMap && sess.membersMap[from.id]) return ctx.answerCbQuery('شما قبلاً ثبت‌نام کرده‌اید.', { show_alert: true });
-      const name = from.username ? `@${from.username}` : (from.first_name || 'کاربر');
-      const teamIdx = assignGkToTeam(sess, from.id, name);
-      if (teamIdx === null) {
-        return ctx.answerCbQuery('تعداد دروازه‌بان‌ها تکمیل شده یا تیم مناسب پیدا نشد.', { show_alert: true });
+      if (!sess || !sess.signupOpen) return ctx.answerCbQuery('ثبت‌نام فعالی وجود ندارد.', { show_alert: true });
+      if (sess.membersMap && sess.membersMap[String(from.id)]) return ctx.answerCbQuery('شما قبلاً ثبت‌نام کرده‌اید.', { show_alert: true });
+      const name = from.username ? `@${from.username}` : (from.first_name || `${from.id}`);
+      const res = assignGkToTeam(sess, from.id, name);
+      if (!res) {
+        await saveSession(chatId, sess);
+        await updateGroupMessage(chatId, sess);
+        return ctx.answerCbQuery('تعداد دروازه‌بان‌ها تکمیل شده یا تیم مناسب وجود ندارد.', { show_alert: true });
       }
       await saveSession(chatId, sess);
-      await updateGroupStatusMessage(bot, chatId, sess);
-      return ctx.answerCbQuery(`✅ شما به عنوان دروازه‌بان در تیم ${teamIdx+1} ثبت شدید.`);
+      await updateGroupMessage(chatId, sess);
+      return ctx.answerCbQuery(`✅ شما دروازه‌بان تیم ${res.team + 1} شدید.`);
     }
 
-    // Reshuffle (admin only)
+    // reshuffle (admin only)
     if (data === 'action:reshuffle') {
-      // check admin
-      const chatId = chat.id;
+      await ctx.answerCbQuery();
+      const chatId = message.chat.id;
       const sess = await loadSession(chatId);
-      const admins = await bot.telegram.getChatAdministrators(chatId);
-      const isAdmin = admins.some(a => a.user.id === from.id);
-      if (!isAdmin) {
-        return ctx.answerCbQuery('⚠️ فقط ادمین می‌تواند این کار را انجام دهد.', { show_alert: true });
-      }
-      // reshuffle
-      const res = reshuffleSession(sess);
-      if (!res.ok) {
+      if (!sess) return ctx.answerCbQuery();
+      // admin check
+      try {
+        const admins = await bot.telegram.getChatAdministrators(chatId);
+        if (!admins.some(a => a.user.id === from.id)) {
+          return ctx.answerCbQuery('⚠️ فقط ادمین می‌تواند این کار را انجام دهد.', { show_alert: true });
+        }
+      } catch (e) { console.error('admin check error', e); }
+      const r = reshuffleSession(sess);
+      if (!r.ok) {
         await saveSession(chatId, sess);
-        await updateGroupStatusMessage(bot, chatId, sess);
-        return ctx.answerCbQuery('⚠️ قاطی‌کردن دوباره ممکن نیست — تعداد دروازه‌بان‌ها کافی نیست.', { show_alert: true });
+        await updateGroupMessage(chatId, sess);
+        return ctx.answerCbQuery('⚠️ قاطی‌کردن دوباره امکان‌پذیر نیست — تعداد دروازه‌بان‌ها کافی نیست.', { show_alert: true });
       }
       await saveSession(chatId, sess);
-      await updateGroupStatusMessage(bot, chatId, sess);
+      await updateGroupMessage(chatId, sess);
       return ctx.answerCbQuery('🔀 بازچینش انجام شد.');
     }
 
-    // fallback
+    // default
     await ctx.answerCbQuery();
   } catch (err) {
-    console.error('callback error', err);
-    try { await ctx.answerCbQuery('خطا رخ داد. دوباره تلاش کنید.', { show_alert: true }); } catch(e){}
+    console.error('callback_query error', err && err.message);
+    try { await ctx.answerCbQuery('❌ خطا — مجدداً تلاش کنید', { show_alert: true }); } catch(e){}
   }
 });
 
-// Private chat text handler (names parsing)
+// private message handler for inside-bot names input
 bot.on('message', async (ctx) => {
   try {
     const chat = ctx.chat;
-    if (chat.type !== 'private') return; // we handle only private typing for names here
+    if (chat.type !== 'private') return;
     const sess = await loadSession(chat.id);
     if (!sess || sess.type !== 'private' || !sess.awaitingNames) return;
-    const text = ctx.message.text || '';
-    // parse: GK lines optionally start with GK: or just lines before empty line
-    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
-    if (lines.length === 0) return ctx.reply('لطفاً اسامی را ارسال کنید (هر نام در یک خط).');
-    // We'll accept format where lines starting with GK: are GKs, else we split by blank line but simpler:
-    const gkNames = [];
-    const playerNames = [];
-    let mode = 'gk'; // until we see a line "---" or "players:"
-    for (const L of lines) {
-      if (/^players?:/i.test(L) || /^بازیکن/i.test(L)) { mode = 'players'; continue; }
-      if (/^gk[:\-]?/i.test(L) || /^دروازه/i.test(L)) {
-        // allow 'GK: Name'
-        const name = L.replace(/^gk[:\-]?\s*/i,'').trim();
-        if (name) gkNames.push(name);
-        else mode='players';
-        continue;
-      }
-      // If we encounter an empty line (we filtered empties), so treat first non-GK after some is player
-      if (mode === 'gk' && gkNames.length>0 && !/^gk[:\-]?/i.test(L)) {
-        mode = 'players';
-      }
-      if (mode === 'gk') gkNames.push(L);
-      else playerNames.push(L);
+    const text = (ctx.message.text || '').trim();
+    if (!text) return ctx.reply('لطفاً اسامی را هر کدام در یک خط ارسال کنید.');
+    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const teamsCount = sess.teamsCount;
+    if (lines.length < teamsCount) {
+      return ctx.reply(`لطفاً حداقل ${teamsCount} نام ارسال کنید — ${teamsCount} نام اول به عنوان دروازه‌بان در نظر گرفته می‌شوند.`);
     }
-    // require gkNames length >= teamsCount
-    if (gkNames.length < sess.teamsCount) {
-      return ctx.reply(`❌ تعداد دروازه‌بان‌ها باید حداقل برابر تعداد تیم‌ها (${sess.teamsCount}) باشد. دروازه‌بان‌ها: ${gkNames.length}`);
-    }
-    // now distribute randomly
+    const gkNames = lines.slice(0, teamsCount);
+    const playerNames = lines.slice(teamsCount);
     shuffle(gkNames);
     shuffle(playerNames);
     // prepare teams
-    const teams = [];
-    for (let i=0;i<sess.teamsCount;i++) teams.push([]);
-    // put GK one per team
-    for (let i=0;i<sess.teamsCount;i++) {
-      teams[i].push({ id: null, name: gkNames[i], role: 'gk' });
-    }
-    // place players round-robin with max 5 per team (including GK)
+    const teams = Array.from({ length: teamsCount }, () => ({ members: [], subs: [] }));
+    for (let i = 0; i < teamsCount; i++) teams[i].members.push({ id: null, name: gkNames[i], role: 'gk' });
     let idx = 0;
-    const extras = [];
     for (const pname of playerNames) {
-      const t = idx % sess.teamsCount;
-      if (teams[t].length < 5) {
-        teams[t].push({ id: null, name: pname, role: 'player' });
-      } else {
-        extras.push(pname);
-      }
+      const tIdx = idx % teamsCount;
+      if (teams[tIdx].members.length < 5) teams[tIdx].members.push({ id: null, name: pname, role: 'player' });
+      else teams[tIdx].subs.push({ id: null, name: pname, role: 'player' });
       idx++;
     }
-    // Build message text
-    let textOut = '🏆 نتایج تیم‌چینی:\n\n';
-    for (let i=0;i<teams.length;i++) {
-      textOut += `🔵 تیم ${i+1}:\n`;
-      for (const p of teams[i]) {
-        const icon = (p.role === 'gk') ? '🧤' : '⚽';
-        textOut += ` ${icon} ${escapeMarkdown(p.name)}\n`;
+    // build output
+    let out = '<b>🏆 نتیجهٔ داخل ربات (شانسی)</b>\n\n';
+    for (let i = 0; i < teamsCount; i++) {
+      out += `<b>🔹 تیم ${i + 1} — ${teams[i].members.length} نفر</b>\n`;
+      for (const m of teams[i].members) out += `${m.role === 'gk' ? '🧤' : '⚽'} ${escapeHtml(m.name)}\n`;
+      if (teams[i].subs.length) {
+        out += `<b>🔄 تعویضی‌های تیم ${i + 1}:</b>\n`;
+        for (const s of teams[i].subs) out += `↳ ${escapeHtml(s.name)}\n`;
       }
-      textOut += '\n';
+      out += '\n';
     }
-    if (extras.length) {
-      textOut += '🔄 بازیکنان ذخیره: ' + extras.map(e=>escapeMarkdown(e)).join(', ') + '\n';
-    }
-    await ctx.reply(textOut, { parse_mode: 'MarkdownV2' });
-    // mark session ended
+    await ctx.reply(out, { parse_mode: 'HTML' });
     sess.awaitingNames = false;
     await saveSession(chat.id, sess);
-
   } catch (err) {
-    console.error('private message handler error', err);
+    console.error('private message handler error', err && err.message);
   }
 });
 
-// health endpoint + webhook express if needed
-if (USE_WEBHOOK && WEBHOOK_URL) {
-  const app = express();
-  app.use(express.json());
-  app.get('/healthz', (req, res) => res.send('OK'));
-  app.post('/telegram-webhook', (req, res, next) => {
-    try {
-      bot.handleUpdate(req.body, res).then(() => res.status(200).end()).catch(next);
-    } catch (e) {
-      next(e);
-    }
-  });
-
-  // start express
-  app.listen(PORT, async () => {
-    console.log('Express webhook server listening on', PORT);
-    // set webhook
-    try {
-      const setRes = await bot.telegram.setWebhook(`${WEBHOOK_URL}`);
-      console.log('Webhook set result:', setRes);
-    } catch (e) {
-      console.error('Failed to set webhook:', e);
-    }
-  });
-} else {
-  // Polling mode
-  (async () => {
-    try {
-      // ensure webhook removed to avoid 409
+// ---------- start with webhook or polling (auto-detect) ----------
+(async function startBot() {
+  try {
+    // If USE_WEBHOOK true and WEBHOOK_URL provided -> webhook mode
+    if (USE_WEBHOOK && WEBHOOK_URL) {
+      const app = express();
+      app.use(express.json());
+      // health
+      app.get('/healthz', (req, res) => res.send('OK'));
+      // webhook endpoint
+      app.post('/telegram-webhook', (req, res) => {
+        bot.handleUpdate(req.body).then(() => res.status(200).end()).catch((e) => {
+          console.error('handleUpdate error', e && e.message);
+          res.status(500).end();
+        });
+      });
+      app.listen(PORT, async () => {
+        console.log(`Express listening on ${PORT}, setting webhook to ${WEBHOOK_URL}`);
+        try {
+          await bot.telegram.setWebhook(WEBHOOK_URL);
+          console.log('Webhook set.');
+        } catch (e) {
+          console.error('Failed to set webhook:', e && e.message);
+        }
+      });
+    } else {
+      // polling mode: remove webhook and launch
       try {
         await bot.telegram.deleteWebhook();
-        console.log('Deleted webhook (if existed).');
+        console.log('Deleted webhook (if any). Starting polling.');
       } catch (e) {
-        // ignore
+        console.warn('deleteWebhook maybe failed', e && e.message);
       }
       await bot.launch();
-      console.log('Bot started (polling) ✅');
-    } catch (err) {
-      console.error('Bot launch error', err);
+      console.log('Bot started with long polling.');
     }
-  })();
-}
 
-// global error handling
+    process.once('SIGINT', () => { bot.stop('SIGINT'); process.exit(0); });
+    process.once('SIGTERM', () => { bot.stop('SIGTERM'); process.exit(0); });
+  } catch (e) {
+    console.error('startBot error', e && e.message);
+    // fallback attempt to polling
+    try { await bot.launch(); console.log('Fallback: bot launched with polling'); } catch(err) { console.error('Fallback failed', err); process.exit(1); }
+  }
+})();
+
+// global error handlers
 process.on('uncaughtException', (err) => {
-  console.error('uncaughtException', err);
-  // optionally send admin alert here
-  // then exit to let host restart
+  console.error('uncaughtException', err && err.stack || err);
+  // exit to allow host to restart (sessions persist if Redis used)
   process.exit(1);
 });
 process.on('unhandledRejection', (reason) => {
   console.error('unhandledRejection', reason);
 });
-
-// export for testing (if needed)
-module.exports = { bot, redis };
