@@ -1,5 +1,5 @@
 {
-  "name": "team-random-bot",
+  "name": "random-team-bot",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
