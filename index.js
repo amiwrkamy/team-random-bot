@@ -1,267 +1,201 @@
-require('dotenv').config();
-const { Telegraf, Markup } = require('telegraf');
+import TelegramBot from "node-telegram-bot-api";
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+const TOKEN = process.env.BOT_TOKEN || "PUT_YOUR_BOT_TOKEN_HERE";
+const bot = new TelegramBot(TOKEN, { polling: true });
 
-/* ===================== STATE ===================== */
+console.log("✅ BOT RUNNING");
 
 const privateSessions = {};
 const groupSessions = {};
 
-/* ===================== UTILS ===================== */
-
-const shuffle = (arr) => arr.sort(() => Math.random() - 0.5);
-
-const buildGroupText = (g) => {
-  let text = '🏆 وضعیت تیم‌ها (لایو)\n\n';
-
-  g.teams.forEach((t, i) => {
-    text += `🔵 تیم ${i + 1}\n`;
-    if (t.gk) text += `🧤 ${t.gk}\n`;
-    t.players.forEach(p => text += `⚽ ${p}\n`);
-    text += '\n';
-  });
-
-  if (g.subs.length)
-    text += `🔄 تعویضی‌ها:\n${g.subs.join('\n')}\n\n`;
-
-  text += '📌 هر نفر فقط یک‌بار می‌تواند ثبت‌نام کند\n';
-  text += '👑 فقط ادمین می‌تواند 🔀 قاطی‌کردن را بزند';
-
-  return text;
-};
-
-const groupKeyboard = Markup.inlineKeyboard([
-  [
-    Markup.button.callback('⚽ بازیکن', 'join_player'),
-    Markup.button.callback('🧤 دروازه‌بان', 'join_gk')
-  ],
-  [
-    Markup.button.callback('🔀 قاطی‌کردن (ادمین)', 'reshuffle')
-  ]
-]);
-
-/* ===================== START ===================== */
-
-bot.start(async (ctx) => {
-  if (ctx.chat.type !== 'private') return;
-
-  await ctx.reply(
-    '🎯 تیم‌چینی کجا انجام شود؟',
-    Markup.inlineKeyboard([
-      [Markup.button.callback('🤖 داخل ربات', 'mode_private')],
-      [Markup.button.callback('👥 داخل گروه', 'mode_group')]
-    ])
-  );
+/* ---------------- START ---------------- */
+bot.onText(/\/start/, (msg) => {
+  const chatId = msg.chat.id;
+  if (msg.chat.type === "private") {
+    bot.sendMessage(chatId, "🎯 حالت اجرا را انتخاب کن:", {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🤖 داخل ربات", callback_data: "MODE_PRIVATE" }],
+          [{ text: "👥 داخل گروه", callback_data: "MODE_GROUP" }]
+        ]
+      }
+    });
+  } else {
+    sendTeamCountSelector(chatId);
+  }
 });
 
-/* ===================== MODE SELECT ===================== */
+/* ---------------- CALLBACK ---------------- */
+bot.on("callback_query", async (q) => {
+  const chatId = q.message.chat.id;
+  const userId = q.from.id;
+  const data = q.data;
 
-bot.action('mode_private', async (ctx) => {
-  privateSessions[ctx.chat.id] = {};
-  await ctx.editMessageText(
-    '🔢 چند تیم می‌خواهی؟',
-    Markup.inlineKeyboard([
-      [Markup.button.callback('۲ تیم', 'p_2')],
-      [Markup.button.callback('۳ تیم', 'p_3')],
-      [Markup.button.callback('۴ تیم', 'p_4')]
-    ])
-  );
-});
+  /* -------- PRIVATE MODE -------- */
+  if (data === "MODE_PRIVATE") {
+    privateSessions[chatId] = {};
+    return sendTeamCountSelector(chatId, true);
+  }
 
-bot.action('mode_group', async (ctx) => {
-  const link = `https://t.me/${ctx.botInfo.username}?startgroup=true`;
-  await ctx.editMessageText(
-    '👥 ربات را به گروه اضافه کن و داخل گروه دستور /start_team را بزن',
-    Markup.inlineKeyboard([
-      [Markup.button.url('➕ افزودن ربات به گروه', link)]
-    ])
-  );
-});
-
-/* ===================== PRIVATE MODE ===================== */
-
-bot.action(/^p_(\d)$/, async (ctx) => {
-  const teams = Number(ctx.match[1]);
-  privateSessions[ctx.chat.id] = { teams };
-
-  await ctx.editMessageText(
-    `✍️ اسامی را بفرست (هر خط یک نفر)\n\n🧤 ابتدا گلرها (${teams} نفر)\n⚽ بعد بازیکن‌ها`
-  );
-});
-
-bot.on('text', async (ctx) => {
-  const sess = privateSessions[ctx.chat.id];
-  if (!sess) return;
-
-  const names = ctx.message.text.split('\n').map(x => x.trim()).filter(Boolean);
-  if (names.length < sess.teams)
-    return ctx.reply('❌ تعداد گلرها کافی نیست');
-
-  const gks = shuffle(names.slice(0, sess.teams));
-  const players = shuffle(names.slice(sess.teams));
-
-  const teams = Array.from({ length: sess.teams }, (_, i) => ({
-    gk: gks[i],
-    players: []
-  }));
-
-  players.forEach(p => {
-    const t = teams.reduce((a, b) =>
-      a.players.length < b.players.length ? a : b
+  if (data.startsWith("P_TEAMS_")) {
+    const teams = Number(data.split("_")[2]);
+    privateSessions[chatId] = { teams };
+    return bot.sendMessage(
+      chatId,
+      "✍️ اسامی را بفرست:\n\nدروازه‌بان‌ها:\nAli\nReza\n\nبازیکن‌ها:\nAmir\nSina"
     );
-    if (t.players.length < 4) t.players.push(p);
-  });
+  }
 
-  let text = '🏆 نتیجه تیم‌چینی\n\n';
-  teams.forEach((t, i) => {
-    text += `🔵 تیم ${i + 1}\n🧤 ${t.gk}\n`;
-    t.players.forEach(p => text += `⚽ ${p}\n`);
-    text += '\n';
-  });
+  /* -------- GROUP MODE -------- */
+  if (data === "MODE_GROUP") {
+    const url = `https://t.me/${(await bot.getMe()).username}?startgroup=true`;
+    return bot.sendMessage(chatId, "➕ ربات را به گروه اضافه کن:", {
+      reply_markup: { inline_keyboard: [[{ text: "افزودن به گروه", url }]] }
+    });
+  }
 
-  await ctx.reply(text);
-  delete privateSessions[ctx.chat.id];
+  if (data.startsWith("G_TEAMS_")) {
+    const teams = Number(data.split("_")[2]);
+    groupSessions[chatId] = {
+      teams,
+      players: [],
+      gks: [],
+      messageId: null
+    };
+    return sendJoinButtons(chatId);
+  }
+
+  const session = groupSessions[chatId];
+  if (!session) return;
+
+  if (data === "JOIN_PLAYER") {
+    if (session.players.find(p => p.id === userId) || session.gks.find(p => p.id === userId))
+      return bot.answerCallbackQuery(q.id, { text: "❌ قبلاً ثبت شدی" });
+
+    session.players.push({ id: userId, name: q.from.first_name });
+    return updateGroupStatus(chatId);
+  }
+
+  if (data === "JOIN_GK") {
+    if (session.gks.length >= session.teams)
+      return bot.answerCallbackQuery(q.id, { text: "❌ دروازه‌بان‌ها تکمیل شدند" });
+
+    if (session.players.find(p => p.id === userId) || session.gks.find(p => p.id === userId))
+      return bot.answerCallbackQuery(q.id, { text: "❌ قبلاً ثبت شدی" });
+
+    session.gks.push({ id: userId, name: q.from.first_name });
+    return updateGroupStatus(chatId);
+  }
+
+  if (data === "RESHUFFLE") {
+    const admins = await bot.getChatAdministrators(chatId);
+    if (!admins.find(a => a.user.id === userId))
+      return bot.answerCallbackQuery(q.id, { text: "❌ فقط ادمین", show_alert: true });
+
+    return distribute(chatId);
+  }
 });
 
-/* ===================== GROUP MODE ===================== */
+/* ---------------- PRIVATE TEXT ---------------- */
+bot.on("message", (msg) => {
+  if (msg.chat.type !== "private") return;
+  const session = privateSessions[msg.chat.id];
+  if (!session || !session.teams) return;
 
-bot.command('start_team', async (ctx) => {
-  if (ctx.chat.type === 'private') return;
+  const lines = msg.text.split("\n");
+  let mode = "";
+  const gks = [], players = [];
 
-  const member = await ctx.getChatMember(ctx.from.id);
-  if (!['administrator', 'creator'].includes(member.status))
-    return ctx.reply('⛔ فقط ادمین');
+  for (const l of lines) {
+    if (l.includes("دروازه")) mode = "gk";
+    else if (l.includes("بازیکن")) mode = "p";
+    else if (l.trim()) {
+      mode === "gk" ? gks.push(l.trim()) : players.push(l.trim());
+    }
+  }
 
-  await ctx.reply(
-    '🔢 تعداد تیم‌ها؟',
-    Markup.inlineKeyboard([
-      [Markup.button.callback('۲ تیم', 'g_2')],
-      [Markup.button.callback('۳ تیم', 'g_3')],
-      [Markup.button.callback('۴ تیم', 'g_4')]
-    ])
-  );
+  if (gks.length < session.teams)
+    return bot.sendMessage(msg.chat.id, "❌ تعداد دروازه‌بان کم است");
+
+  const teams = makeTeams(session.teams, gks, players);
+  bot.sendMessage(msg.chat.id, formatTeams(teams));
+  delete privateSessions[msg.chat.id];
 });
 
-bot.action(/^g_(\d)$/, async (ctx) => {
-  const teamsCount = Number(ctx.match[1]);
-
-  groupSessions[ctx.chat.id] = {
-    teamsCount,
-    teams: Array.from({ length: teamsCount }, () => ({ gk: null, players: [] })),
-    subs: [],
-    users: {},
-    messageId: null
-  };
-
-  const msg = await ctx.reply(buildGroupText(groupSessions[ctx.chat.id]), groupKeyboard);
-  groupSessions[ctx.chat.id].messageId = msg.message_id;
-});
-
-/* ===================== JOIN PLAYER ===================== */
-
-bot.action('join_player', async (ctx) => {
-  const g = groupSessions[ctx.chat.id];
-  if (!g) return;
-
-  if (g.users[ctx.from.id])
-    return ctx.answerCbQuery('قبلاً ثبت شدی');
-
-  g.users[ctx.from.id] = true;
-  const name = ctx.from.first_name;
-
-  const team = g.teams.reduce((a, b) =>
-    (a.players.length + (a.gk ? 1 : 0)) <
-    (b.players.length + (b.gk ? 1 : 0)) ? a : b
-  );
-
-  if (team.players.length + (team.gk ? 1 : 0) < 5)
-    team.players.push(name);
-  else
-    g.subs.push(name);
-
-  await bot.telegram.editMessageText(
-    ctx.chat.id,
-    g.messageId,
-    null,
-    buildGroupText(g),
-    groupKeyboard
-  );
-
-  ctx.answerCbQuery('✅ ثبت شد');
-});
-
-/* ===================== JOIN GK ===================== */
-
-bot.action('join_gk', async (ctx) => {
-  const g = groupSessions[ctx.chat.id];
-  if (!g) return;
-
-  if (g.users[ctx.from.id])
-    return ctx.answerCbQuery('قبلاً ثبت شدی');
-
-  const team = g.teams.find(t => !t.gk);
-  if (!team)
-    return ctx.answerCbQuery('همه تیم‌ها گلر دارند');
-
-  g.users[ctx.from.id] = true;
-  team.gk = ctx.from.first_name;
-
-  await bot.telegram.editMessageText(
-    ctx.chat.id,
-    g.messageId,
-    null,
-    buildGroupText(g),
-    groupKeyboard
-  );
-
-  ctx.answerCbQuery('🧤 گلر ثبت شد');
-});
-
-/* ===================== RESHUFFLE ===================== */
-
-bot.action('reshuffle', async (ctx) => {
-  const member = await ctx.getChatMember(ctx.from.id);
-  if (!['administrator', 'creator'].includes(member.status))
-    return ctx.answerCbQuery('⛔ فقط ادمین');
-
-  const g = groupSessions[ctx.chat.id];
-  if (!g) return;
-
-  let all = [];
-  g.teams.forEach(t => {
-    if (t.gk) all.push({ n: t.gk, r: 'gk' });
-    t.players.forEach(p => all.push({ n: p, r: 'p' }));
-  });
-  g.subs.forEach(s => all.push({ n: s, r: 'p' }));
-
-  shuffle(all);
-  g.teams = Array.from({ length: g.teamsCount }, () => ({ gk: null, players: [] }));
-  g.subs = [];
-
-  all.forEach(x => {
-    if (x.r === 'gk') {
-      const t = g.teams.find(t => !t.gk);
-      if (t) t.gk = x.n;
-    } else {
-      const t = g.teams.find(t => t.players.length + (t.gk ? 1 : 0) < 5);
-      if (t) t.players.push(x.n);
-      else g.subs.push(x.n);
+/* ---------------- HELPERS ---------------- */
+function sendTeamCountSelector(chatId, isPrivate = false) {
+  const prefix = isPrivate ? "P" : "G";
+  bot.sendMessage(chatId, "🔢 تعداد تیم‌ها:", {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "۲ تیم ⚽", callback_data: `${prefix}_TEAMS_2` }],
+        [{ text: "۳ تیم ⚽", callback_data: `${prefix}_TEAMS_3` }],
+        [{ text: "۴ تیم ⚽", callback_data: `${prefix}_TEAMS_4` }]
+      ]
     }
   });
+}
 
-  await bot.telegram.editMessageText(
-    ctx.chat.id,
-    g.messageId,
-    null,
-    buildGroupText(g),
-    groupKeyboard
-  );
+function sendJoinButtons(chatId) {
+  bot.sendMessage(chatId, "🎯 نقش خود را انتخاب کن:", {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "⚽ بازیکن", callback_data: "JOIN_PLAYER" },
+          { text: "🥅 دروازه‌بان", callback_data: "JOIN_GK" }
+        ],
+        [{ text: "🔀 شانس دوباره (ادمین)", callback_data: "RESHUFFLE" }]
+      ]
+    }
+  });
+}
 
-  ctx.answerCbQuery('🔀 دوباره شانسی شد');
-});
+function updateGroupStatus(chatId) {
+  const s = groupSessions[chatId];
+  const text =
+    `🏆 وضعیت تیم‌ها\n\n` +
+    `🥅 دروازه‌بان‌ها: ${s.gks.map(p => p.name).join(", ") || "—"}\n` +
+    `⚽ بازیکن‌ها: ${s.players.map(p => p.name).join(", ") || "—"}\n\n` +
+    `📌 هر نفر فقط یک‌بار`;
 
-/* ===================== RUN ===================== */
+  if (s.messageId) {
+    bot.editMessageText(text, { chat_id: chatId, message_id: s.messageId });
+  } else {
+    bot.sendMessage(chatId, text).then(m => (s.messageId = m.message_id));
+  }
 
-bot.launch();
-console.log('✅ Bot is running');
+  if (s.gks.length === s.teams) distribute(chatId);
+}
+
+function distribute(chatId) {
+  const s = groupSessions[chatId];
+  const teams = makeTeams(s.teams, s.gks.map(x => x.name), s.players.map(x => x.name));
+  bot.sendMessage(chatId, formatTeams(teams));
+}
+
+function makeTeams(count, gks, players) {
+  shuffle(gks);
+  shuffle(players);
+
+  const teams = Array.from({ length: count }, (_, i) => [`🥅 ${gks[i]}`]);
+  let i = 0;
+
+  for (const p of players) {
+    teams[i % count].length < 5 && teams[i % count].push(`⚽ ${p}`);
+    i++;
+  }
+  return teams;
+}
+
+function formatTeams(teams) {
+  return teams
+    .map((t, i) => `🔵 تیم ${i + 1}\n${t.join("\n")}`)
+    .join("\n\n");
+}
+
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  }
