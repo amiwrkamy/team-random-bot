@@ -1,9 +1,7 @@
 {
-  "name": "teamchin-final-2",
+  "name": "teamchin-bot",
   "version": "1.0.0",
-  "description": "TeamChin advanced live random team bot",
   "main": "index.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
