@@ -1,7 +1,6 @@
 {
-  "name": "random-team-bot",
+  "name": "team-picker-bot",
   "version": "1.0.0",
-  "description": "Telegram random team & group picker bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
