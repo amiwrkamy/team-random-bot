@@ -1,136 +1,164 @@
-const { Telegraf, Markup } = require("telegraf");
+const TelegramBot = require("node-telegram-bot-api");
+const express = require("express");
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+const TOKEN = process.env.BOT_TOKEN;
+const bot = new TelegramBot(TOKEN, { polling: true });
 
-// ====== حافظه ساده ======
-const sessions = {}; // key = chatId
+// ---------- Web server (برای Render) ----------
+const app = express();
+app.get("/", (req, res) => res.send("Bot is running"));
+app.listen(process.env.PORT || 3000);
 
-function getName(user) {
-  return user.username ? `@${user.username}` : user.first_name;
+// ---------- حافظه ----------
+let users = []; // { id, name }
+let teamsCount = 2;
+
+// ---------- ابزار ----------
+function getName(user, textName = null) {
+  if (user.username) return "@" + user.username;
+  if (textName) return textName;
+  return user.first_name || "بازیکن";
 }
 
-function initSession(chatId) {
-  sessions[chatId] = {
-    mode: null, // "bot" | "group"
-    teamCount: 2,
-    players: [],
-    teams: []
-  };
+function shuffle(array) {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
 }
 
-// ====== START ======
-bot.start((ctx) => {
-  initSession(ctx.chat.id);
-  ctx.reply(
+// ---------- /start ----------
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
     "🏟 تیم‌چینی کجا انجام بشه؟",
-    Markup.inlineKeyboard([
-      [Markup.button.callback("👤 داخل ربات", "MODE_BOT")],
-      [Markup.button.callback("👥 داخل گروه", "MODE_GROUP")]
-    ])
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "👤 داخل ربات", callback_data: "IN_BOT" }],
+          [{ text: "👥 داخل گروه", callback_data: "IN_GROUP" }]
+        ]
+      }
+    }
   );
 });
 
-// ====== MODE ======
-bot.action("MODE_BOT", async (ctx) => {
-  await ctx.answerCbQuery();
-  sessions[ctx.chat.id].mode = "bot";
-  ctx.reply(
-    "🧮 چند تیم می‌خوای؟",
-    Markup.inlineKeyboard([
-      [Markup.button.callback("🔵 ۲ تیم", "BOT_2")],
-      [Markup.button.callback("🟢 ۳ تیم", "BOT_3")]
-    ])
-  );
+// ---------- دکمه‌ها ----------
+bot.on("callback_query", async (q) => {
+  const chatId = q.message.chat.id;
+  const data = q.data;
+  const user = q.from;
+
+  // داخل ربات
+  if (data === "IN_BOT") {
+    bot.sendMessage(chatId, "✍️ اسم بازیکن‌ها رو با فاصله بفرست");
+    bot.once("message", (m) => {
+      const names = m.text.split(" ").filter(Boolean);
+      shuffle(names);
+
+      const teams = Array.from({ length: teamsCount }, () => []);
+      names.forEach((n, i) => teams[i % teamsCount].push(n));
+
+      let text = "🎲 نتیجه تیم‌بندی:\n\n";
+      teams.forEach((t, i) => {
+        text += `🏆 تیم ${i + 1}:\n`;
+        t.forEach(p => text += `⚽ ${p}\n`);
+        text += "\n";
+      });
+
+      bot.sendMessage(chatId, text);
+    });
+  }
+
+  // داخل گروه (لینک ارسال)
+  if (data === "IN_GROUP") {
+    const link = `https://t.me/${bot.username}?startgroup=teamchin`;
+    bot.sendMessage(
+      chatId,
+      `👥 روی لینک بزن و ربات رو به گروه بفرست:\n${link}`
+    );
+  }
+
+  // انتخاب تعداد تیم
+  if (data === "TEAM_2" || data === "TEAM_3") {
+    teamsCount = data === "TEAM_2" ? 2 : 3;
+    users = [];
+
+    bot.editMessageText(
+      "🏆 تیم‌چینی شروع شد!\nنقش خودتو انتخاب کن 👇",
+      {
+        chat_id: chatId,
+        message_id: q.message.message_id,
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "⚽ بازیکن", callback_data: "JOIN" }],
+            [{ text: "🔄 قاطی‌کردن دوباره", callback_data: "RESHUFFLE" }]
+          ]
+        }
+      }
+    );
+  }
+
+  // ثبت‌نام
+  if (data === "JOIN") {
+    if (users.find(u => u.id === user.id)) return;
+
+    users.push({ id: user.id, name: getName(user) });
+    updateTeams(chatId, q.message.message_id);
+  }
+
+  // قاطی دوباره (ادمین)
+  if (data === "RESHUFFLE") {
+    const admins = await bot.getChatAdministrators(chatId);
+    if (!admins.find(a => a.user.id === user.id)) return;
+
+    updateTeams(chatId, q.message.message_id, true);
+  }
+
+  bot.answerCallbackQuery(q.id);
 });
 
-bot.action("MODE_GROUP", async (ctx) => {
-  await ctx.answerCbQuery();
-  sessions[ctx.chat.id].mode = "group";
-  ctx.reply(
-    "🧮 چند تیم می‌خوای؟",
-    Markup.inlineKeyboard([
-      [Markup.button.callback("🔵 ۲ تیم", "GROUP_2")],
-      [Markup.button.callback("🟢 ۳ تیم", "GROUP_3")]
-    ])
-  );
+// ---------- پیام ورود ربات به گروه ----------
+bot.on("message", (msg) => {
+  if (msg.new_chat_members) {
+    bot.sendMessage(
+      msg.chat.id,
+      "🧮 چند تیم می‌خوای؟",
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🔵 ۲ تیم", callback_data: "TEAM_2" }],
+            [{ text: "🟢 ۳ تیم", callback_data: "TEAM_3" }]
+          ]
+        }
+      }
+    );
+  }
 });
 
-// ====== BOT MODE ======
-bot.action(["BOT_2", "BOT_3"], async (ctx) => {
-  await ctx.answerCbQuery();
-  const count = ctx.callbackQuery.data === "BOT_2" ? 2 : 3;
-  sessions[ctx.chat.id].teamCount = count;
-  ctx.reply("✍️ اسم بازیکن‌ها رو با فاصله بفرست");
-});
+// ---------- ساخت تیم ----------
+function updateTeams(chatId, messageId, reshuffle = false) {
+  let list = [...users];
+  shuffle(list);
 
-bot.on("text", (ctx) => {
-  const s = sessions[ctx.chat.id];
-  if (!s || s.mode !== "bot") return;
+  const teams = Array.from({ length: teamsCount }, () => []);
+  list.forEach((u, i) => teams[i % teamsCount].push(u.name));
 
-  const names = ctx.message.text.split(" ").filter(Boolean);
-  const shuffled = names.sort(() => Math.random() - 0.5);
-
-  const teams = Array.from({ length: s.teamCount }, () => []);
-  shuffled.forEach((p, i) => teams[i % s.teamCount].push(p));
-
-  let msg = "🏆 نتیجه تیم‌ها:\n\n";
+  let text = "🎲 تیم‌ها (لایو):\n\n";
   teams.forEach((t, i) => {
-    msg += `🔥 تیم ${i + 1}:\n`;
-    t.forEach(n => msg += `⚽ ${n}\n`);
-    msg += "\n";
+    text += `🏆 تیم ${i + 1}:\n`;
+    t.forEach(p => text += `⚽ ${p}\n`);
+    text += "\n";
   });
 
-  ctx.reply(msg);
-  initSession(ctx.chat.id);
-});
-
-// ====== GROUP MODE ======
-bot.action(["GROUP_2", "GROUP_3"], async (ctx) => {
-  await ctx.answerCbQuery();
-  const count = ctx.callbackQuery.data === "GROUP_2" ? 2 : 3;
-  const chatId = ctx.chat.id;
-
-  sessions[chatId].teamCount = count;
-  sessions[chatId].teams = Array.from({ length: count }, () => []);
-
-  ctx.reply(
-    "🏆 تیم‌چینی شروع شد!\nنقش خودتو انتخاب کن 👇",
-    Markup.inlineKeyboard([
-      [Markup.button.callback("⚽ بازیکن", "JOIN_PLAYER")],
-      [Markup.button.callback("🧤 دروازه‌بان", "JOIN_GK")]
-    ])
-  );
-});
-
-bot.action(["JOIN_PLAYER", "JOIN_GK"], async (ctx) => {
-  await ctx.answerCbQuery();
-  const chatId = ctx.chat.id;
-  const s = sessions[chatId];
-  if (!s) return;
-
-  const name = getName(ctx.from);
-  if (s.players.includes(name)) return;
-
-  s.players.push(name);
-  const teamIndex = Math.floor(Math.random() * s.teamCount);
-  s.teams[teamIndex].push(name);
-
-  let msg = "🏆 وضعیت تیم‌ها:\n\n";
-  s.teams.forEach((t, i) => {
-    msg += `🔥 تیم ${i + 1}:\n`;
-    t.forEach(n => msg += `⚽ ${n}\n`);
-    msg += "\n";
+  bot.editMessageText(text, {
+    chat_id: chatId,
+    message_id: messageId,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "⚽ بازیکن", callback_data: "JOIN" }],
+        [{ text: "🔄 قاطی‌کردن دوباره", callback_data: "RESHUFFLE" }]
+      ]
+    }
   });
-
-  ctx.editMessageText(
-    msg,
-    Markup.inlineKeyboard([
-      [Markup.button.callback("⚽ بازیکن", "JOIN_PLAYER")],
-      [Markup.button.callback("🧤 دروازه‌بان", "JOIN_GK")]
-    ])
-  );
-});
-
-// ====== RUN ======
-bot.launch();
-console.log("🤖 Team bot running");
+}
