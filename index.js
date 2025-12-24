@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const cron = require('node-cron');
+const crypto = require('crypto');
 const { Telegraf, Markup } = require('telegraf');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -12,7 +13,7 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-const DATA_FILE = path.join(process.cwd(), 'data.json'); // persistent state
+const DATA_FILE = path.join(process.cwd(), 'data.json');
 const BACKUP_DIR = path.join(process.cwd(), 'backups');
 const PORT = process.env.PORT || 3000;
 if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
@@ -59,14 +60,26 @@ cron.schedule('*/5 * * * *', () => {
   }
 });
 
-// ---------- utils ----------
-function shuffle(arr) {
+// ---------- crypto-based utilities ----------
+function secureRandomInt(max) {
+  // returns integer in [0, max)
+  if (max <= 0) return 0;
+  return crypto.randomInt(max);
+}
+function secureShuffle(arr) {
+  // Fisher-Yates using crypto.randomInt
   for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = crypto.randomInt(i + 1);
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
   return arr;
 }
+function secureChoice(arr) {
+  if (!arr || arr.length === 0) return null;
+  return arr[crypto.randomInt(arr.length)];
+}
+
+// ---------- helpers ----------
 function displayName(user) {
   if (!user) return '—';
   if (user.username) return '@' + user.username;
@@ -74,27 +87,26 @@ function displayName(user) {
   return parts.join(' ') || `${user.id}`;
 }
 
-// ---------- in-memory lock per chat to avoid concurrent edits ----------
+// locks to avoid race conditions
 const locks = new Map();
 async function acquire(chatId) {
-  while (locks.get(chatId)) {
-    await new Promise(r => setTimeout(r, 25));
-  }
+  while (locks.get(chatId)) await new Promise(r => setTimeout(r, 20));
   locks.set(chatId, true);
 }
 function release(chatId) { locks.delete(chatId); }
 
-// ---------- load store ----------
+// ---------- store ----------
 const store = loadData(); // { chats: { chatId: {...} } }
 
-// ---------- core team operations ----------
+// ---------- core logic with balanced assignment ----------
+
 function ensureChat(chatId, teamsCount = 2) {
   const key = String(chatId);
   if (!store.chats[key]) {
     store.chats[key] = {
       chatId: key,
       teamsCount,
-      teams: Array.from({ length: teamsCount }, () => []), // arrays of members
+      teams: Array.from({ length: teamsCount }, () => []),
       substitutes: [],
       registered: {}, // userId -> {id,name,role,teamIndex}
       message_id: null,
@@ -103,7 +115,6 @@ function ensureChat(chatId, teamsCount = 2) {
     };
     saveAll(store);
   } else {
-    // if teamsCount changed, reset teams & registrations
     if (store.chats[key].teamsCount !== teamsCount) {
       store.chats[key].teamsCount = teamsCount;
       store.chats[key].teams = Array.from({ length: teamsCount }, () => []);
@@ -116,7 +127,14 @@ function ensureChat(chatId, teamsCount = 2) {
   return store.chats[key];
 }
 
-function findKeeperSlots(state) {
+// return sizes (count of non-sub entries) for each team
+function teamEffectiveSize(team) {
+  // team entries have role: 'keeper'|'player'|'sub'
+  return team.filter(x => x.role !== 'sub').length;
+}
+
+// find teams without keeper
+function keeperSlots(state) {
   const res = [];
   for (let i = 0; i < state.teamsCount; i++) {
     const hasKeeper = state.teams[i].some(p => p.role === 'keeper');
@@ -124,94 +142,135 @@ function findKeeperSlots(state) {
   }
   return res;
 }
-function teamsWithSpace(state) {
-  const res = [];
-  for (let i = 0; i < state.teamsCount; i++) {
-    if (state.teams[i].filter(p => p.role !== 'sub').length < 5) res.push(i);
+
+// Balanced selection for keeper: among teams without keeper choose one(s) with minimal effective size
+function chooseBalancedKeeperTeam(state) {
+  const slots = keeperSlots(state);
+  if (!slots.length) return null;
+  // compute sizes
+  let minSize = Infinity;
+  const best = [];
+  for (const idx of slots) {
+    const sz = teamEffectiveSize(state.teams[idx]);
+    if (sz < minSize) {
+      minSize = sz;
+      best.length = 0;
+      best.push(idx);
+    } else if (sz === minSize) {
+      best.push(idx);
+    }
   }
-  return res;
+  return secureChoice(best);
 }
 
-// assign one entry randomly and maintain registered + persistence
+// Balanced selection for player: prefer teams with smallest effective size (<5)
+function chooseBalancedPlayerTeam(state) {
+  // collect teams with size < 5
+  let minSize = Infinity;
+  for (let i = 0; i < state.teamsCount; i++) {
+    const s = teamEffectiveSize(state.teams[i]);
+    if (s < minSize) minSize = s;
+  }
+  // prefer teams with size == minSize and s < 5
+  const candidates = [];
+  for (let i = 0; i < state.teamsCount; i++) {
+    const s = teamEffectiveSize(state.teams[i]);
+    if (s === minSize && s < 5) candidates.push(i);
+  }
+  if (candidates.length > 0) return secureChoice(candidates);
+  // else, if no team has space (<5), return null for substitute
+  return null;
+}
+
+// assign entry (balanced + secure randomness)
 function assignEntry(state, entry) {
-  // entry: { id:string, name:string, role: 'player'|'keeper' }
+  // entry: { id, name, role: 'keeper'|'player' }
   if (entry.role === 'keeper') {
-    const slots = findKeeperSlots(state);
-    if (slots.length === 0) {
+    const choice = chooseBalancedKeeperTeam(state);
+    if (choice === null || choice === undefined) {
       return { ok: false, reason: 'no_keeper_slot' };
     }
-    shuffle(slots);
-    const pick = slots[0];
-    state.teams[pick].push({ ...entry, role: 'keeper', teamIndex: pick });
-    state.registered[entry.id] = { ...entry, role: 'keeper', teamIndex: pick };
+    state.teams[choice].push({ ...entry, role: 'keeper', teamIndex: choice });
+    state.registered[entry.id] = { ...entry, role: 'keeper', teamIndex: choice };
     state.lastUpdated = Date.now();
     saveAll(store);
-    return { ok: true, teamIndex: pick };
+    return { ok: true, teamIndex: choice };
   } else {
-    const elig = teamsWithSpace(state);
-    if (elig.length === 0) {
-      // put into substitutes
+    const choice = chooseBalancedPlayerTeam(state);
+    if (choice === null) {
+      // no team has space -> substitute
       state.substitutes.push({ ...entry, role: 'sub', teamIndex: -1 });
       state.registered[entry.id] = { ...entry, role: 'sub', teamIndex: -1 };
       state.lastUpdated = Date.now();
       saveAll(store);
       return { ok: true, substitute: true };
+    } else {
+      state.teams[choice].push({ ...entry, role: 'player', teamIndex: choice });
+      state.registered[entry.id] = { ...entry, role: 'player', teamIndex: choice };
+      state.lastUpdated = Date.now();
+      saveAll(store);
+      return { ok: true, teamIndex: choice };
     }
-    // choose random eligible team (ensures shuffling + balance)
-    shuffle(elig);
-    const pick = elig[0];
-    state.teams[pick].push({ ...entry, role: 'player', teamIndex: pick });
-    state.registered[entry.id] = { ...entry, role: 'player', teamIndex: pick };
-    state.lastUpdated = Date.now();
-    saveAll(store);
-    return { ok: true, teamIndex: pick };
   }
 }
 
-// reshuffle all current registered users (only admin)
+// reshuffle balanced: reassign keepers first then players to keep balance
 function reshuffleAll(state) {
-  // collect keepers and players (ignore substitutes for now, we'll reassign them after)
   const keepers = [];
   const players = [];
   for (const uid in state.registered) {
     const r = state.registered[uid];
     if (r.role === 'keeper') keepers.push({ id: r.id, name: r.name, role: 'keeper' });
-    else players.push({ id: r.id, name: r.name, role: 'player' });
+    else if (r.role === 'player' || r.role === 'sub') players.push({ id: r.id, name: r.name, role: 'player' });
   }
-  // reset all
+
+  // reset
   state.teams = Array.from({ length: state.teamsCount }, () => []);
   state.substitutes = [];
   state.registered = {};
-  // randomize keepers and place up to teamsCount
-  shuffle(keepers);
+
+  // shuffle keepers securely and assign each to team with smallest size (initially 0)
+  secureShuffle(keepers);
   for (let i = 0; i < keepers.length; i++) {
     if (i < state.teamsCount) {
       state.teams[i].push({ ...keepers[i], role: 'keeper', teamIndex: i });
       state.registered[keepers[i].id] = { ...keepers[i], role: 'keeper', teamIndex: i };
     } else {
-      // overflow keepers -> becomes players
+      // extra keepers become players
       players.push({ id: keepers[i].id, name: keepers[i].name, role: 'player' });
     }
   }
-  // shuffle players and assign into random teams with capacity <5
-  shuffle(players);
+
+  // shuffle players securely and assign one-by-one to the team with smallest effective size (<5)
+  secureShuffle(players);
   for (const p of players) {
-    const elig = teamsWithSpace(state);
-    if (elig.length === 0) {
+    // find teams with minimal size (<5)
+    let minSize = Infinity;
+    for (let i = 0; i < state.teamsCount; i++) {
+      const s = teamEffectiveSize(state.teams[i]);
+      if (s < minSize) minSize = s;
+    }
+    const candidates = [];
+    for (let i = 0; i < state.teamsCount; i++) {
+      const s = teamEffectiveSize(state.teams[i]);
+      if (s === minSize && s < 5) candidates.push(i);
+    }
+    if (candidates.length === 0) {
+      // all full -> substitute
       state.substitutes.push({ ...p, role: 'sub', teamIndex: -1 });
       state.registered[p.id] = { ...p, role: 'sub', teamIndex: -1 };
     } else {
-      shuffle(elig);
-      const pick = elig[0];
+      const pick = secureChoice(candidates);
       state.teams[pick].push({ ...p, role: 'player', teamIndex: pick });
       state.registered[p.id] = { ...p, role: 'player', teamIndex: pick };
     }
   }
+
   state.lastUpdated = Date.now();
   saveAll(store);
 }
 
-// pretty format message (Persian, emojis)
+// ---------- formatting + keyboard ----------
 function formatTeams(state) {
   const lines = [];
   lines.push('🏆 وضعیت تیم‌ها (لایو)');
@@ -241,10 +300,24 @@ function formatTeams(state) {
   return lines.join('\n');
 }
 
+function buildKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '⚽ ثبت بازیکن', callback_data: 'role:player' },
+        { text: '🧤 ثبت دروازه‌بان', callback_data: 'role:keeper' }
+      ],
+      [
+        { text: '🔀 قاطی‌کردن دوباره (ادمین)', callback_data: 'reshuffle' }
+      ]
+    ]
+  };
+}
+
 // ---------- bot setup ----------
 const bot = new Telegraf(BOT_TOKEN);
 
-// delete webhook to avoid 409
+// attempt to remove webhook (avoid 409)
 (async () => {
   try {
     await bot.telegram.deleteWebhook();
@@ -254,29 +327,29 @@ const bot = new Telegraf(BOT_TOKEN);
   }
 })();
 
-// private /start: ask where (inside bot / inside group)
+// ---------- handlers (private & group flows) ----------
+const privateFlows = {}; // userId -> { teamsCount, waitingNames }
+
 bot.start(async (ctx) => {
   try {
     if (ctx.chat.type === 'private') {
-      await ctx.reply('🤖 ربات «تیم‌چین» — خوش آمدی!\nمی‌خوای تیم‌چینی داخل ربات انجام بشه یا داخل گروه؟',
+      await ctx.reply('🤖 ربات «تیم‌چین» — خوش آمدی!\nمی‌خوای داخل ربات تیم‌بندی کنی یا داخل گروه؟',
         Markup.inlineKeyboard([
-          [Markup.button.callback('👤 داخل ربات', 'flow:pv_inside')],
-          [Markup.button.callback('👥 داخل گروه', 'flow:pv_group')]
+          [Markup.button.callback('👤 داخل ربات', 'pv_inside')],
+          [Markup.button.callback('👥 داخل گروه', 'pv_group')]
         ]));
     } else {
-      await ctx.reply('برای شروع تیم‌چینی ادمین گروه دستور /start_team را اجرا کند.');
+      await ctx.reply('در گروه: ادمین دستور /start_team را اجرا کند.');
     }
   } catch (e) { console.error('start error', e); }
 });
 
-// admin command inside group to create live team message
 bot.command('start_team', async (ctx) => {
   try {
     if (!['group','supergroup'].includes(ctx.chat.type)) return ctx.reply('این دستور فقط داخل گروه کار می‌کند.');
     const member = await ctx.getChatMember(ctx.from.id);
     if (!['administrator','creator'].includes(member.status)) return ctx.reply('فقط ادمین می‌تواند تیم‌چینی را شروع کند.');
-    // ask how many teams
-    await ctx.reply('چند تیم می‌خوای؟ 🧮', Markup.inlineKeyboard([
+    await ctx.reply('چند تیم می‌خواهی؟ 🧮', Markup.inlineKeyboard([
       [Markup.button.callback('2️⃣ ۲ تیم', 'choose:2')],
       [Markup.button.callback('3️⃣ ۳ تیم', 'choose:3')],
       [Markup.button.callback('4️⃣ ۴ تیم', 'choose:4')]
@@ -284,37 +357,25 @@ bot.command('start_team', async (ctx) => {
   } catch (e) { console.error('start_team', e); }
 });
 
-// private flows
-const privateFlows = {}; // userId -> { teamsCount, waitingNames }
-
-bot.action('flow:pv_inside', async (ctx) => {
-  try {
-    if (ctx.chat.type !== 'private') return ctx.answerCbQuery();
-    await ctx.editMessageText('🔢 داخل ربات — چند تیم می‌خوای؟',
-      Markup.inlineKeyboard([
-        [Markup.button.callback('2️⃣ ۲ تیم', 'pv_choose:2'), Markup.button.callback('3️⃣ ۳ تیم', 'pv_choose:3')],
-        [Markup.button.callback('4️⃣ ۴ تیم', 'pv_choose:4')]
-      ]));
-  } catch (e) { console.error(e); }
+// private handlers
+bot.action('pv_inside', async (ctx) => {
+  if (ctx.chat.type !== 'private') return ctx.answerCbQuery();
+  await ctx.editMessageText('🔢 داخل ربات — چند تیم می‌خوای؟',
+    Markup.inlineKeyboard([[Markup.button.callback('2️⃣ ۲ تیم','pv_choose:2'), Markup.button.callback('3️⃣ ۳ تیم','pv_choose:3')],[Markup.button.callback('4️⃣ ۴ تیم','pv_choose:4')]]));
 });
-
-bot.action('flow:pv_group', async (ctx) => {
-  try {
-    if (ctx.chat.type !== 'private') return ctx.answerCbQuery();
-    const botName = ctx.botInfo.username || 'bot';
-    await ctx.editMessageText(`برای استفاده داخل گروه:\n1) ربات را به گروه اضافه کن.\n2) ادمین در گروه دستور /start_team را اجرا کند.\n(نام ربات: @${botName})`);
-  } catch (e) { console.error(e); }
+bot.action('pv_group', async (ctx) => {
+  if (ctx.chat.type !== 'private') return ctx.answerCbQuery();
+  const botName = ctx.botInfo.username || 'bot';
+  await ctx.editMessageText(`برای استفاده داخل گروه:\n1) ربات را به گروه اضافه کن\n2) ادمین /start_team را اجرا کند\nنام ربات: @${botName}`);
 });
-
 bot.action(/pv_choose:(\d+)/, async (ctx) => {
-  try {
-    const cnt = Number(ctx.match[1]);
-    privateFlows[ctx.from.id] = { teamsCount: cnt, waitingNames: true };
-    await ctx.editMessageText('✍️ اسم‌ها را با فاصله ارسال کن (مثال: Ali Reza Sara Mina). پس از ارسال ربات آن‌ها را شانسی تقسیم می‌کند.');
-  } catch (e) { console.error(e); }
+  const cnt = Number(ctx.match[1]);
+  if (ctx.chat.type !== 'private') return ctx.answerCbQuery();
+  privateFlows[ctx.from.id] = { teamsCount: cnt, waitingNames: true };
+  await ctx.editMessageText('✍️ اسم‌ها را با فاصله ارسال کن (مثال: Ali Reza Sara). بعد از ارسال، ربات آن‌ها را شانسی و متعادل تقسیم می‌کند.');
 });
 
-// handle private text names
+// private text handler (names)
 bot.on('message', async (ctx, next) => {
   try {
     if (ctx.chat.type === 'private' && ctx.message && ctx.message.text) {
@@ -324,27 +385,32 @@ bot.on('message', async (ctx, next) => {
         if (!raw) return ctx.reply('لطفاً حداقل یک نام وارد کنید.');
         const names = raw.split(/\s+/).filter(Boolean);
         if (!names.length) return ctx.reply('لطفاً حداقل یک نام وارد کنید.');
-        // build entries
         const entries = names.map((n, i) => ({ id: `pv_${ctx.from.id}_${i}_${Date.now()}`, name: n, role: 'player' }));
-        shuffle(entries);
+        secureShuffle(entries);
+        // temp balanced assignment
         const tempState = { teamsCount: flow.teamsCount, teams: Array.from({ length: flow.teamsCount }, () => []), substitutes: [], registered: {} };
         for (const e of entries) {
-          // reuse assignEntry logic but adapted to tempState
-          const elig = [];
+          // pick team with min effective size (<5)
+          let minSize = Infinity;
           for (let i = 0; i < tempState.teamsCount; i++) {
-            if (tempState.teams[i].filter(p => p.role !== 'sub').length < 5) elig.push(i);
+            const s = teamEffectiveSize(tempState.teams[i]);
+            if (s < minSize) minSize = s;
           }
-          if (elig.length === 0) {
+          const candidates = [];
+          for (let i = 0; i < tempState.teamsCount; i++) {
+            const s = teamEffectiveSize(tempState.teams[i]);
+            if (s === minSize && s < 5) candidates.push(i);
+          }
+          if (candidates.length === 0) {
             tempState.substitutes.push({ ...e, role: 'sub', teamIndex: -1 });
             tempState.registered[e.id] = { ...e, role: 'sub', teamIndex: -1 };
           } else {
-            shuffle(elig);
-            const pick = elig[0];
+            const pick = secureChoice(candidates);
             tempState.teams[pick].push({ ...e, role: 'player', teamIndex: pick });
             tempState.registered[e.id] = { ...e, role: 'player', teamIndex: pick };
           }
         }
-        // format output
+        // format result
         const out = ['🎲 نتیجهٔ تیم‌ها:',''];
         const emojis = ['🔵 تیم 1','🟢 تیم 2','🟡 تیم 3','🟠 تیم 4'];
         for (let i = 0; i < tempState.teamsCount; i++) {
@@ -366,18 +432,17 @@ bot.on('message', async (ctx, next) => {
   return next();
 });
 
-// group choose team count (admin)
+// group: choose team count
 bot.action(/choose:(\d+)/, async (ctx) => {
   try {
     if (!['group','supergroup'].includes(ctx.chat.type)) return ctx.answerCbQuery();
-    const admin = await ctx.getChatMember(ctx.from.id);
-    if (!['administrator','creator'].includes(admin.status)) return ctx.answerCbQuery('فقط ادمین می‌تواند تعداد تیم را انتخاب کند.');
+    const member = await ctx.getChatMember(ctx.from.id);
+    if (!['administrator','creator'].includes(member.status)) return ctx.answerCbQuery('فقط ادمین می‌تواند تعداد تیم را انتخاب کند.');
     const cnt = Number(ctx.match[1]);
     const chatId = ctx.chat.id;
     await acquire(chatId);
     try {
       const state = ensureChat(chatId, cnt);
-      // reset state for new session
       state.teamsCount = cnt;
       state.teams = Array.from({ length: cnt }, () => []);
       state.substitutes = [];
@@ -386,31 +451,19 @@ bot.action(/choose:(\d+)/, async (ctx) => {
       state.lastUpdated = Date.now();
       saveAll(store);
 
-      // send interactive live message and save message_id
-      const sent = await ctx.reply('🏆 تیم‌چینی شروع شد!\nنقش خودتو انتخاب کن 👇', Markup.inlineKeyboard([
-        [Markup.button.callback('⚽ بازیکن', 'role:player'), Markup.button.callback('🧤 دروازه‌بان', 'role:keeper')],
-        [Markup.button.callback('🔀 قاطی‌کردن دوباره (ادمین)', 'reshuffle')]
-      ]));
+      const sent = await ctx.reply('🏆 تیم‌چینی شروع شد!\nنقش خودتو انتخاب کن 👇', { reply_markup: buildKeyboard() });
       state.message_id = sent.message_id;
       saveAll(store);
 
-      // edit it immediately to show empty teams too
       try {
-        await ctx.telegram.editMessageText(chatId, state.message_id, null, formatTeams(state), {
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: '⚽ بازیکن', callback_data: 'role:player' }, { text: '🧤 دروازه‌بان', callback_data: 'role:keeper' }],
-              [{ text: '🔀 قاطی‌کردن دوباره (ادمین)', callback_data: 'reshuffle' }]
-            ]
-          }
-        });
-      } catch(e){ /* ignore */ }
+        await ctx.telegram.editMessageText(chatId, state.message_id, null, formatTeams(state), { reply_markup: buildKeyboard() });
+      } catch(e){}
     } finally { release(chatId); }
     await ctx.answerCbQuery();
   } catch (e) { console.error('choose action', e); }
 });
 
-// role callbacks in group
+// group role callbacks
 bot.action('role:player', async (ctx) => {
   try {
     if (!['group','supergroup'].includes(ctx.chat.type)) return ctx.answerCbQuery('این دکمه فقط در گروه کار می‌کند.');
@@ -423,18 +476,10 @@ bot.action('role:player', async (ctx) => {
       if (state.registered[uid]) return ctx.answerCbQuery('شما قبلاً ثبت‌نام کرده‌اید.');
       const entry = { id: uid, name: displayName(ctx.from), role: 'player' };
       const res = assignEntry(state, entry);
-      if (res.substitute) {
-        await ctx.answerCbQuery('تیم‌ها پر هستند — شما به عنوان تعویضی ثبت شدید.');
-      } else {
-        await ctx.answerCbQuery('شما به تیم اضافه شدید ✅');
-      }
-      // update main message
+      if (res.substitute) await ctx.answerCbQuery('تیم‌ها پر هستند — شما به عنوان تعویضی ثبت شدید.');
+      else await ctx.answerCbQuery('شما به تیم اضافه شدید ✅');
       if (state.message_id) {
-        try {
-          await ctx.telegram.editMessageText(chatId, state.message_id, null, formatTeams(state), {
-            parse_mode: 'HTML'
-          });
-        } catch(e){}
+        try { await ctx.telegram.editMessageText(chatId, state.message_id, null, formatTeams(state), { reply_markup: buildKeyboard() }); } catch(e){}
       }
     } finally { release(chatId); }
   } catch (e) { console.error('role:player', e); }
@@ -450,43 +495,39 @@ bot.action('role:keeper', async (ctx) => {
       if (!state) return ctx.answerCbQuery('هنوز مسابقه‌ای فعال نیست.');
       const uid = String(ctx.from.id);
       if (state.registered[uid]) return ctx.answerCbQuery('شما قبلاً ثبت‌نام کرده‌اید.');
-      const avail = findKeeperSlots(state);
-      if (avail.length === 0) return ctx.answerCbQuery('همهٔ تیم‌ها دروازه‌بان دارند.');
+      const slot = chooseBalancedKeeperTeam(state);
+      if (slot === null) return ctx.answerCbQuery('همهٔ تیم‌ها دروازه‌بان دارند.');
       const entry = { id: uid, name: displayName(ctx.from), role: 'keeper' };
       const res = assignEntry(state, entry);
-      await ctx.answerCbQuery('🧤 شما به عنوان دروازه‌بان ثبت شدید.');
+      if (res.ok) await ctx.answerCbQuery('🧤 شما به عنوان دروازه‌بان ثبت شدید.');
       if (state.message_id) {
-        try {
-          await ctx.telegram.editMessageText(chatId, state.message_id, null, formatTeams(state));
-        } catch(e){}
+        try { await ctx.telegram.editMessageText(chatId, state.message_id, null, formatTeams(state), { reply_markup: buildKeyboard() }); } catch(e){}
       }
     } finally { release(chatId); }
   } catch (e) { console.error('role:keeper', e); }
 });
 
-// reshuffle (admin only)
+// reshuffle by admin
 bot.action('reshuffle', async (ctx) => {
   try {
     if (!['group','supergroup'].includes(ctx.chat.type)) return ctx.answerCbQuery();
     const info = await ctx.getChatMember(ctx.from.id);
-    if (!['administrator','creator'].includes(info.status)) return ctx.answerCbQuery('فقط ادمین می‌تواند این کاررو انجام دهد.');
+    if (!['administrator','creator'].includes(info.status)) return ctx.answerCbQuery('فقط ادمین می‌تواند این کار را انجام دهد.');
     const chatId = ctx.chat.id;
     await acquire(chatId);
     try {
       const state = store.chats[String(chatId)];
-      if (!state) return ctx.answerCbQuery('فعال نیست.');
+      if (!state) return ctx.answerCbQuery('فعالی نیست.');
       reshuffleAll(state);
       if (state.message_id) {
-        try {
-          await ctx.telegram.editMessageText(chatId, state.message_id, null, formatTeams(state));
-        } catch(e){}
+        try { await ctx.telegram.editMessageText(chatId, state.message_id, null, formatTeams(state), { reply_markup: buildKeyboard() }); } catch(e){}
       }
-      await ctx.answerCbQuery('🔀 تیم‌ها دوباره شانسی چیده شدند.');
+      await ctx.answerCbQuery('🔀 تیم‌ها دوباره شانسی و متعادل چیده شدند.');
     } finally { release(chatId); }
   } catch (e) { console.error('reshuffle', e); }
 });
 
-// ---------- start bot listener (polling) ----------
+// ---------- launch ----------
 (async () => {
   try {
     await bot.launch({ dropPendingUpdates: true });
@@ -497,12 +538,5 @@ bot.action('reshuffle', async (ctx) => {
   }
 })();
 
-// express health (render)
-const app = express();
-app.get('/healthz', (req, res) => res.send({ ok: true, time: new Date().toISOString() }));
-app.get('/', (req, res) => res.send('team-random-bot running'));
-app.listen(PORT, () => console.log('HTTP server running on port', PORT));
-
-// graceful
-process.once('SIGINT', () => { bot.stop('SIGINT'); process.exit(0); });
-process.once('SIGTERM', () => { bot.stop('SIGTERM'); process.exit(0); });
+// express health
+const app = ex
