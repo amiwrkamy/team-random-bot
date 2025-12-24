@@ -1,67 +1,36 @@
-const TelegramBot = require("node-telegram-bot-api");
 
-const token = process.env.BOT_TOKEN;
-const bot = new TelegramBot(token, { polling: true });
+import TelegramBot from "node-telegram-bot-api";
 
-let teamsCount = 0;
-let players = {};
-let teams = [];
+const TOKEN = process.env.BOT_TOKEN;
+const bot = new TelegramBot(TOKEN, { polling: true });
 
 bot.onText(/\/start/, (msg) => {
-  players = {};
-  teams = [];
-  teamsCount = 0;
-
-  bot.sendMessage(msg.chat.id, "تعداد تیم‌ها رو انتخاب کن:", {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "۲ تیم", callback_data: "2" }],
-        [{ text: "۳ تیم", callback_data: "3" }],
-      ],
-    },
-  });
+  bot.sendMessage(
+    msg.chat.id,
+    "سلام 👋\nاسم بازیکن‌ها رو با فاصله بفرست تا تیم‌بندی کنم\n\nمثال:\nali reza sara mina"
+  );
 });
 
-bot.on("callback_query", (query) => {
-  const chatId = query.message.chat.id;
+bot.on("message", (msg) => {
+  if (!msg.text || msg.text.startsWith("/")) return;
 
-  if (!teamsCount) {
-    teamsCount = Number(query.data);
-    teams = Array.from({ length: teamsCount }, () => []);
+  const players = msg.text.split(" ").filter(Boolean);
 
-    bot.sendMessage(chatId, "برای ورود به تیم شانسی دکمه رو بزن 👇", {
-      reply_markup: {
-        inline_keyboard: [[{ text: "🎲 ورود به تیم", callback_data: "join" }]],
-      },
-    });
+  if (players.length < 2) {
+    bot.sendMessage(msg.chat.id, "حداقل ۲ اسم بفرست 🙂");
     return;
   }
 
-  if (query.data === "join") {
-    const userId = query.from.id;
-    const name = query.from.first_name;
+  const shuffled = players.sort(() => Math.random() - 0.5);
+  const team1 = [];
+  const team2 = [];
 
-    if (players[userId]) {
-      bot.answerCallbackQuery(query.id, {
-        text: "❌ قبلاً وارد تیم شدی",
-        show_alert: true,
-      });
-      return;
-    }
+  shuffled.forEach((p, i) => {
+    (i % 2 === 0 ? team1 : team2).push(p);
+  });
 
-    const randomTeam = Math.floor(Math.random() * teamsCount);
-    teams[randomTeam].push(name);
-    players[userId] = randomTeam;
-
-    let text = `✅ ${name} رفت تو تیم ${randomTeam + 1}\n\n`;
-    teams.forEach((t, i) => {
-      text += `🏷 تیم ${i + 1}: ${t.join("، ") || "-"}\n`;
-    });
-
-    bot.editMessageText(text, {
-      chat_id: chatId,
-      message_id: query.message.message_id,
-      reply_markup: query.message.reply_markup,
-    });
-  }
+  bot.sendMessage(
+    msg.chat.id,
+    `🏆 تیم ۱:\n${team1.join(" , ")}\n\n🔥 تیم ۲:\n${team2.join(" , ")}`
+  );
 });
