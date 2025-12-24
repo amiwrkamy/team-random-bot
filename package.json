@@ -1,18 +1,12 @@
 {
-  "name": "team-random-bot-resilient",
+  "name": "random-group-team-bot",
   "version": "1.0.0",
-  "description": "Resilient Random Team Picker Bot (private + group)",
+  "description": "Telegram random team & group bot",
   "main": "index.js",
-  "engines": {
-    "node": ">=18"
-  },
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "telegraf": "^4.16.3",
-    "dotenv": "^16.4.5",
-    "express": "^4.18.2",
-    "node-cron": "^3.0.2"
+    "node-telegram-bot-api": "^0.64.0"
   }
 }
