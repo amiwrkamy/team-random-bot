@@ -1,11 +1,13 @@
 {
-  "name": "team-picker-bot",
+  "name": "team-random-bot",
   "version": "1.0.0",
+  "description": "Telegram random team picker (private + group) - stable",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "node-telegram-bot-api": "^0.63.0"
+    "telegraf": "^4.16.3",
+    "dotenv": "^16.4.5"
   }
 }
