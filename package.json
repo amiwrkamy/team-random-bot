@@ -1,12 +1,12 @@
 {
-  "name": "teamchin-bot",
+  "name": "random-group-team-bot",
   "version": "1.0.0",
+  "description": "Random Team Builder Telegram Bot",
   "main": "index.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "telegraf": "^4.16.2"
+    "telegraf": "^4.16.3"
   }
 }
