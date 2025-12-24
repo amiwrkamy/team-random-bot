@@ -1,7 +1,7 @@
 {
-  "name": "teamchin-final",
+  "name": "teamchin-final-2",
   "version": "1.0.0",
-  "description": "Team-chin - random live team builder for Telegram groups",
+  "description": "TeamChin advanced live random team bot",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
