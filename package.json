@@ -1,7 +1,7 @@
 {
-  "name": "random-group-team-bot",
+  "name": "random-team-bot",
   "version": "1.0.0",
-  "description": "Telegram random team & group bot",
+  "description": "Telegram random team generator bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
