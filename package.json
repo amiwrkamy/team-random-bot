@@ -1,12 +1,13 @@
 {
   "name": "random-team-bot",
   "version": "1.0.0",
+  "description": "Random team picker bot (robust)",
   "main": "index.js",
-  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "dotenv": "^16.0.3",
     "node-telegram-bot-api": "^0.61.0"
   }
 }
