@@ -1,7 +1,7 @@
 {
   "name": "team-chin-bot",
   "version": "1.0.0",
-  "description": "Telegram random team generator bot",
+  "description": "Telegram random team generator bot - robust",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
