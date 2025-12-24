@@ -1,12 +1,13 @@
 {
-  "name": "random-team-bot",
+  "name": "telegram-team-random-bot",
   "version": "1.0.0",
-  "description": "Telegram random team generator bot",
+  "description": "Telegram bot for random team selection with live group buttons",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "node-telegram-bot-api": "^0.64.0"
+    "node-telegram-bot-api": "^0.61.0"
   }
 }
