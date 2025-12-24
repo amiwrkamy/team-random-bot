@@ -1,11 +1,13 @@
 {
-  "name": "team-random-bot",
+  "name": "team-chin-bot",
   "version": "1.0.0",
+  "description": "Telegram random team generator bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "telegraf": "^4.16.0"
+    "node-telegram-bot-api": "^0.61.0",
+    "express": "^4.18.2"
   }
 }
