@@ -1,5 +1,5 @@
 {
-  "name": "team-random-bot",
+  "name": "telegram-team-random-bot",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
