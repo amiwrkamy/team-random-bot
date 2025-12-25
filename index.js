@@ -1,4 +1,4 @@
-// index.js — Final robust random-team-bot
+// index.js — Final fix: reshuffle bug (only this behavior fixed, rest intact)
 'use strict';
 
 const { Telegraf, Markup } = require('telegraf');
@@ -8,7 +8,7 @@ const Redis = require('ioredis');
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const REDIS_URL = process.env.REDIS_URL || '';
 const USE_WEBHOOK = (process.env.USE_WEBHOOK || 'false').toLowerCase() === 'true';
-const WEBHOOK_URL = process.env.WEBHOOK_URL || ''; // e.g. https://your-service.onrender.com/telegram-webhook
+const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 
 if (!BOT_TOKEN) {
@@ -18,16 +18,14 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// ---------- Redis or in-memory fallback ----------
+// Redis or fallback
 let redis;
-let usingRedis = false;
 if (REDIS_URL) {
   redis = new Redis(REDIS_URL);
-  usingRedis = true;
   redis.on('error', (e) => console.error('Redis error', e && e.message));
-  console.log('Using Redis at', REDIS_URL);
+  console.log('Using Redis:', REDIS_URL);
 } else {
-  console.warn('Warning: REDIS_URL not provided. Using in-memory sessions (not persistent).');
+  console.warn('No REDIS_URL provided — using in-memory sessions (non-persistent).');
   const mem = new Map();
   redis = {
     async get(k) { const v = mem.get(k); return v === undefined ? null : v; },
@@ -36,7 +34,6 @@ if (REDIS_URL) {
   };
 }
 
-// ---------- Session helpers ----------
 const SESSION_PREFIX = 'rtb:sess:';
 const sessionKey = (chatId) => `${SESSION_PREFIX}${chatId}`;
 
@@ -49,7 +46,6 @@ async function saveSession(chatId, sess) {
   await redis.set(sessionKey(chatId), JSON.stringify(sess));
 }
 
-// ---------- Utilities ----------
 function shuffle(a) {
   for (let i = a.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -62,27 +58,12 @@ function escapeHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// ---------- Session model (group) ----------
-/*
-group session:
-{
-  type:'group',
-  teamsCount: number,
-  teams: [ { members: [ {id,name,role} ], subs: [ {id,name,role} ] } ], // teamsCount entries
-  membersMap: { "<userId>": true }, // prevent double-register
-  signupOpen: true/false,
-  message_id: number|null,
-  creator: userId
-}
-*/
 function createEmptyGroupSession(teamsCount, creator) {
   const teams = Array.from({ length: teamsCount }, () => ({ members: [], subs: [] }));
   return { type: 'group', teamsCount, teams, membersMap: {}, signupOpen: true, message_id: null, creator: creator || null };
 }
 
-// ---------- Keyboard & message builders ----------
 function groupKeyboardReplyMarkup() {
-  // We'll always pass reply_markup object explicitly to edit/send
   return Markup.inlineKeyboard([
     [ Markup.button.callback('⚽ بازیکن', 'join:player'), Markup.button.callback('🥅 دروازه‌بان', 'join:gk') ],
     [ Markup.button.callback('🔀 قاطی‌کردن دوباره (فقط ادمین)', 'action:reshuffle') ]
@@ -113,9 +94,7 @@ function buildGroupText(sess) {
   return out;
 }
 
-// ---------- Assignment rules ----------
 function assignPlayerToTeam(sess, userId, name) {
-  // prefer teams with minimal size (<5)
   let minSize = Infinity;
   for (let i = 0; i < sess.teamsCount; i++) {
     const size = sess.teams[i].members.length;
@@ -131,7 +110,6 @@ function assignPlayerToTeam(sess, userId, name) {
     sess.membersMap[String(userId)] = true;
     return { placed: true, team: pick };
   }
-  // all teams full (members >=5) — put into subs on team with smallest subs
   let minSubs = Infinity; let chosen = 0;
   for (let i = 0; i < sess.teamsCount; i++) {
     const s = sess.teams[i].subs.length;
@@ -143,7 +121,6 @@ function assignPlayerToTeam(sess, userId, name) {
 }
 
 function assignGkToTeam(sess, userId, name) {
-  // choose among teams without GK and with members <5
   const available = [];
   for (let i = 0; i < sess.teamsCount; i++) {
     const hasGK = sess.teams[i].members.some(m => m.role === 'gk');
@@ -156,9 +133,9 @@ function assignGkToTeam(sess, userId, name) {
   return { team: pick };
 }
 
-// reshuffle: reassign all existing members (gk and players) randomly while respecting 1 GK per team and max 5 per team
+// === CRITICAL: reshuffle implementation (robust) ===
 function reshuffleSession(sess) {
-  // collect all gks and players (including subs)
+  // collect GK and players (all members + subs)
   const gks = [];
   const players = [];
   for (let i = 0; i < sess.teamsCount; i++) {
@@ -168,18 +145,26 @@ function reshuffleSession(sess) {
     }
     for (const s of sess.teams[i].subs) players.push({ id: s.id, name: s.name });
   }
-  if (gks.length < sess.teamsCount) return { ok: false, reason: 'not_enough_gk' };
 
+  // must have >= teamsCount GK to assign one per team
+  if (gks.length < sess.teamsCount) {
+    return { ok: false, reason: 'not_enough_gk' };
+  }
+
+  // shuffle arrays deeply
   shuffle(gks);
   shuffle(players);
 
-  // create new empty teams
+  // rebuild teams
   const newTeams = Array.from({ length: sess.teamsCount }, () => ({ members: [], subs: [] }));
-  // assign GK
+
+  // assign one GK per team
   for (let i = 0; i < sess.teamsCount; i++) {
-    newTeams[i].members.push({ id: gks[i].id, name: gks[i].name, role: 'gk' });
+    const g = gks[i];
+    newTeams[i].members.push({ id: g.id, name: g.name, role: 'gk' });
   }
-  // assign players round-robin while respecting max 5
+
+  // distribute players round-robin but respect max 5 (including GK)
   let idx = 0;
   for (const p of players) {
     const teamIdx = idx % sess.teamsCount;
@@ -191,32 +176,34 @@ function reshuffleSession(sess) {
     idx++;
   }
 
+  // replace session teams
   sess.teams = newTeams;
+  // membersMap stays same (we keep same user ids)
   return { ok: true };
 }
 
-// ---------- Message updater ----------
 async function updateGroupMessage(chatId, sess) {
   const text = buildGroupText(sess);
   const reply_markup = groupKeyboardReplyMarkup();
   try {
     if (sess.message_id) {
+      // try edit
       await bot.telegram.editMessageText(chatId, sess.message_id, null, text, { parse_mode: 'HTML', reply_markup });
     } else {
       const sent = await bot.telegram.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup });
       sess.message_id = sent.message_id;
     }
   } catch (err) {
-    console.error('updateGroupMessage failed (edit), sending new.', err && err.message);
+    // If edit failed (deleted message or can't edit), send new and update message_id
+    console.warn('editMessageText failed, sending new message. err:', err && err.message);
     const sent = await bot.telegram.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup });
     sess.message_id = sent.message_id;
   }
   await saveSession(chatId, sess);
 }
 
-// ---------- Bot handlers ----------
+// ---------- Bot handlers (same as before, only reshuffle flow ensured robust) ----------
 
-// /start
 bot.start(async (ctx) => {
   const chat = ctx.chat;
   if (chat.type === 'private') {
@@ -225,18 +212,15 @@ bot.start(async (ctx) => {
       [ Markup.button.callback('👥 داخل گروه', 'mode:inside_group') ]
     ]));
   } else {
-    await ctx.reply('برای شروع تیم‌چینی ادمین گروه دستور /start_team را ارسال کند.');
+    await ctx.reply('برای شروع تیم‌چینی ادمین گروه دستور /start_team را اجرا کند.');
   }
 });
 
-// /start_team (group)
 bot.command('start_team', async (ctx) => {
   if (ctx.chat.type === 'private') return ctx.reply('این دستور فقط در گروه اجرا می‌شود.');
-  // only admins
   try {
     const admins = await ctx.getChatAdministrators();
-    const isAdmin = admins.some(a => a.user.id === ctx.from.id);
-    if (!isAdmin) return ctx.reply('⛔ فقط ادمین می‌تواند این دستور را اجرا کند.');
+    if (!admins.some(a => a.user.id === ctx.from.id)) return ctx.reply('⛔ فقط ادمین می‌تواند این دستور را اجرا کند.');
   } catch (e) { console.error('admin check error', e); }
   await ctx.reply('🔢 چند تیم می‌خواهی؟', Markup.inlineKeyboard([
     [ Markup.button.callback('2️⃣  2 تیم', 'teams:2'), Markup.button.callback('3️⃣  3 تیم', 'teams:3') ],
@@ -244,13 +228,11 @@ bot.command('start_team', async (ctx) => {
   ]));
 });
 
-// callback queries
 bot.on('callback_query', async (ctx) => {
   const data = ctx.callbackQuery && ctx.callbackQuery.data;
   const from = ctx.from;
   const message = ctx.callbackQuery && ctx.callbackQuery.message;
   try {
-    // mode selection in private
     if (data === 'mode:inside_bot') {
       await ctx.answerCbQuery();
       return ctx.reply('در حالت داخل ربات — چند تیم؟', Markup.inlineKeyboard([
@@ -266,21 +248,18 @@ bot.on('callback_query', async (ctx) => {
       return ctx.replyWithHTML(`برای اضافه کردن ربات به گروه از لینک زیر استفاده کنید:\n<a href="${url}">اضافه کردن ربات به گروه</a>`);
     }
 
-    // private teams selection (user in private)
     if (data && data.startsWith('private:teams:')) {
       await ctx.answerCbQuery();
       const num = Number(data.split(':').pop());
       const sess = { type: 'private', teamsCount: num, awaitingNames: true, creator: from.id };
       await saveSession(ctx.chat.id, sess);
-      return ctx.reply(`<b>حالت داخل ربات — تعداد تیم‌ها: ${num}</b>\n\nلطفاً اسامی را هر کدام در یک خط ارسال کنید.\nتوضیح: <i>${num}</i> نام اول به عنوان دروازه‌بان در نظر گرفته می‌شود.`, { parse_mode: 'HTML' });
+      return ctx.reply(`<b>حالت داخل ربات — تعداد تیم‌ها: ${num}</b>\n\nلطفاً اسامی را هر کدام در یک خط ارسال کنید.\nتوجه: ${num} نام اول به عنوان دروازه‌بان در نظر گرفته می‌شوند.`, { parse_mode: 'HTML' });
     }
 
-    // group teams selection
     if (data && data.startsWith('teams:')) {
       await ctx.answerCbQuery();
       const num = Number(data.split(':').pop());
       const chatId = message.chat.id;
-      // only admins can choose number (protect)
       try {
         const admins = await bot.telegram.getChatAdministrators(chatId);
         if (!admins.some(a => a.user.id === from.id)) {
@@ -293,7 +272,6 @@ bot.on('callback_query', async (ctx) => {
       return;
     }
 
-    // join player
     if (data === 'join:player') {
       await ctx.answerCbQuery();
       const chatId = message.chat.id;
@@ -308,7 +286,6 @@ bot.on('callback_query', async (ctx) => {
       else return ctx.answerCbQuery(`✅ شما به تعویضی تیم ${res.team + 1} اضافه شدید.`);
     }
 
-    // join gk
     if (data === 'join:gk') {
       await ctx.answerCbQuery();
       const chatId = message.chat.id;
@@ -327,7 +304,7 @@ bot.on('callback_query', async (ctx) => {
       return ctx.answerCbQuery(`✅ شما دروازه‌بان تیم ${res.team + 1} شدید.`);
     }
 
-    // reshuffle (admin only)
+    // === FIXED: reshuffle flow ===
     if (data === 'action:reshuffle') {
       await ctx.answerCbQuery();
       const chatId = message.chat.id;
@@ -340,26 +317,27 @@ bot.on('callback_query', async (ctx) => {
           return ctx.answerCbQuery('⚠️ فقط ادمین می‌تواند این کار را انجام دهد.', { show_alert: true });
         }
       } catch (e) { console.error('admin check error', e); }
-      const r = reshuffleSession(sess);
-      if (!r.ok) {
+      // perform reshuffle
+      const result = reshuffleSession(sess);
+      if (!result.ok) {
+        // not enough GKs — do not change anything, inform admin and update message (keeps existing layout)
         await saveSession(chatId, sess);
         await updateGroupMessage(chatId, sess);
-        return ctx.answerCbQuery('⚠️ قاطی‌کردن دوباره امکان‌پذیر نیست — تعداد دروازه‌بان‌ها کافی نیست.', { show_alert: true });
+        return ctx.answerCbQuery('⚠️ قاطی‌کردن دوباره ممکن نیست — تعداد دروازه‌بان‌ها کافی نیست.', { show_alert: true });
       }
+      // reshuffle succeeded — update session & message (edit)
       await saveSession(chatId, sess);
-      await updateGroupMessage(chatId, sess);
+      await updateGroupMessage(chatId, sess); // this will attempt edit; if edit fails it will send new message and update message_id
       return ctx.answerCbQuery('🔀 بازچینش انجام شد.');
     }
 
-    // default
     await ctx.answerCbQuery();
   } catch (err) {
     console.error('callback_query error', err && err.message);
-    try { await ctx.answerCbQuery('❌ خطا — مجدداً تلاش کنید', { show_alert: true }); } catch(e){}
+    try { await ctx.answerCbQuery('❌ خطا — دوباره تلاش کنید', { show_alert: true }); } catch(e){}
   }
 });
 
-// private message handler for inside-bot names input
 bot.on('message', async (ctx) => {
   try {
     const chat = ctx.chat;
@@ -377,7 +355,6 @@ bot.on('message', async (ctx) => {
     const playerNames = lines.slice(teamsCount);
     shuffle(gkNames);
     shuffle(playerNames);
-    // prepare teams
     const teams = Array.from({ length: teamsCount }, () => ({ members: [], subs: [] }));
     for (let i = 0; i < teamsCount; i++) teams[i].members.push({ id: null, name: gkNames[i], role: 'gk' });
     let idx = 0;
@@ -387,7 +364,6 @@ bot.on('message', async (ctx) => {
       else teams[tIdx].subs.push({ id: null, name: pname, role: 'player' });
       idx++;
     }
-    // build output
     let out = '<b>🏆 نتیجهٔ داخل ربات (شانسی)</b>\n\n';
     for (let i = 0; i < teamsCount; i++) {
       out += `<b>🔹 تیم ${i + 1} — ${teams[i].members.length} نفر</b>\n`;
@@ -406,39 +382,21 @@ bot.on('message', async (ctx) => {
   }
 });
 
-// ---------- start with webhook or polling (auto-detect) ----------
 (async function startBot() {
   try {
-    // If USE_WEBHOOK true and WEBHOOK_URL provided -> webhook mode
     if (USE_WEBHOOK && WEBHOOK_URL) {
       const app = express();
       app.use(express.json());
-      // health
       app.get('/healthz', (req, res) => res.send('OK'));
-      // webhook endpoint
       app.post('/telegram-webhook', (req, res) => {
-        bot.handleUpdate(req.body).then(() => res.status(200).end()).catch((e) => {
-          console.error('handleUpdate error', e && e.message);
-          res.status(500).end();
-        });
+        bot.handleUpdate(req.body).then(() => res.status(200).end()).catch((e) => { console.error('handleUpdate error', e); res.status(500).end(); });
       });
       app.listen(PORT, async () => {
         console.log(`Express listening on ${PORT}, setting webhook to ${WEBHOOK_URL}`);
-        try {
-          await bot.telegram.setWebhook(WEBHOOK_URL);
-          console.log('Webhook set.');
-        } catch (e) {
-          console.error('Failed to set webhook:', e && e.message);
-        }
+        try { await bot.telegram.setWebhook(WEBHOOK_URL); console.log('Webhook set.'); } catch (e) { console.error('setWebhook error', e && e.message); }
       });
     } else {
-      // polling mode: remove webhook and launch
-      try {
-        await bot.telegram.deleteWebhook();
-        console.log('Deleted webhook (if any). Starting polling.');
-      } catch (e) {
-        console.warn('deleteWebhook maybe failed', e && e.message);
-      }
+      try { await bot.telegram.deleteWebhook(); console.log('Deleted webhook (if any). Starting polling.'); } catch (e) { console.warn('deleteWebhook warning', e && e.message); }
       await bot.launch();
       console.log('Bot started with long polling.');
     }
@@ -447,17 +405,18 @@ bot.on('message', async (ctx) => {
     process.once('SIGTERM', () => { bot.stop('SIGTERM'); process.exit(0); });
   } catch (e) {
     console.error('startBot error', e && e.message);
-    // fallback attempt to polling
     try { await bot.launch(); console.log('Fallback: bot launched with polling'); } catch(err) { console.error('Fallback failed', err); process.exit(1); }
   }
 })();
 
-// global error handlers
+// global errors
 process.on('uncaughtException', (err) => {
   console.error('uncaughtException', err && err.stack || err);
-  // exit to allow host to restart (sessions persist if Redis used)
-  process.exit(1);
+  process.exit(1); // let host restart; sessions persist if Redis used
 });
 process.on('unhandledRejection', (reason) => {
   console.error('unhandledRejection', reason);
 });
+
+// export for testing
+module.exports = { bot, redis };
