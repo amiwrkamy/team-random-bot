@@ -1,12 +1,31 @@
-{
-  "name": "football-telegram-bot",
-  "version": "1.0.0",
-  "description": "Simple Telegram football dice game bot",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "telegraf": "^4.16.2"
-  }
-}
+import random
+
+MAX_TEAM_SIZE = 5
+
+def shuffle_teams(players, goalkeepers, team_count):
+    random.shuffle(players)
+    random.shuffle(goalkeepers)
+
+    teams = {i: [] for i in range(1, team_count + 1)}
+
+    # تخصیص فقط یک دروازه‌بان به هر تیم
+    for i in range(min(team_count, len(goalkeepers))):
+        teams[i + 1].append(("🧤", goalkeepers[i]))
+
+    pool = players[:]
+    random.shuffle(pool)
+
+    for p in pool:
+        # تیم‌هایی که جا دارن
+        available = [t for t in teams if len(teams[t]) < MAX_TEAM_SIZE]
+        if not available:
+            break
+
+        # حفظ اختلاف ۰ یا ۱
+        min_size = min(len(teams[t]) for t in available)
+        candidates = [t for t in available if len(teams[t]) == min_size]
+
+        chosen = random.choice(candidates)
+        teams[chosen].append(("⚽", p))
+
+    return teams
