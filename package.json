@@ -1,32 +1,17 @@
-import random
-
-MAX_TEAM_SIZE = 5
-
-def shuffle_teams(players, goalkeepers, team_count):
-    # شانسی واقعی
-    random.shuffle(players)
-    random.shuffle(goalkeepers)
-
-    teams = {i: [] for i in range(1, team_count + 1)}
-
-    # هر تیم حداکثر یک دروازه‌بان
-    for i in range(min(team_count, len(goalkeepers))):
-        teams[i + 1].append(("🧤", goalkeepers[i]))
-
-    pool = players[:]
-    random.shuffle(pool)
-
-    for p in pool:
-        # تیم‌هایی که جا دارن
-        available = [t for t in teams if len(teams[t]) < MAX_TEAM_SIZE]
-        if not available:
-            break
-
-        # اختلاف ۰ یا ۱
-        min_size = min(len(teams[t]) for t in available)
-        candidates = [t for t in available if len(teams[t]) == min_size]
-
-        chosen = random.choice(candidates)
-        teams[chosen].append(("⚽", p))
-
-    return teams
+{
+  "name": "random-team-bot",
+  "version": "1.0.0",
+  "description": "Random team picker bot (group & private) with Redis sessions and webhook/polling auto-detect",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ioredis": "^5.3.2",
+    "telegraf": "^4.12.3"
+  }
+}
