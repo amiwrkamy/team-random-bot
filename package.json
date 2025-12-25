@@ -1,6 +1,7 @@
 {
-  "name": "team-random-bot",
+  "name": "telegram-team-bot",
   "version": "1.0.0",
+  "description": "Random Team Bot",
   "type": "module",
   "main": "index.js",
   "scripts": {
