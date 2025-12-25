@@ -1,12 +1,12 @@
 {
-  "name": "football-dice-bot",
+  "name": "team-random-bot",
   "version": "1.0.0",
   "main": "index.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "telegraf": "^4.16.2"
+    "express": "^4.18.2",
+    "node-telegram-bot-api": "^0.64.0"
   }
 }
