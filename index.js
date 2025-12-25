@@ -1,20 +1,36 @@
 import { Telegraf, Markup } from "telegraf";
 import dotenv from "dotenv";
+import express from "express";
 
 dotenv.config();
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const PORT = process.env.PORT || 3000;
 
 if (!BOT_TOKEN) {
   console.error("❌ BOT_TOKEN not found");
   process.exit(1);
 }
 
+/* =========================
+   HTTP SERVER (FOR RENDER)
+========================= */
+const app = express();
+
+app.get("/", (req, res) => {
+  res.send("🤖 Telegram bot is running");
+});
+
+app.listen(PORT, () => {
+  console.log(`🌐 HTTP server running on port ${PORT}`);
+});
+
+/* =========================
+   TELEGRAM BOT
+========================= */
 const bot = new Telegraf(BOT_TOKEN);
 
-// =======================
-// START
-// =======================
+/* START */
 bot.start((ctx) => {
   ctx.reply(
     "🤖 ربات تیم‌کشی آماده است",
@@ -25,16 +41,12 @@ bot.start((ctx) => {
   );
 });
 
-// =======================
-// HELP
-// =======================
+/* HELP */
 bot.hears("ℹ️ راهنما", (ctx) => {
-  ctx.reply("📌 برای شروع تیم‌کشی روی 🎲 تیم‌کشی بزن");
+  ctx.reply("📌 روی 🎲 تیم‌کشی بزن تا شروع کنیم");
 });
 
-// =======================
-// TEAM RANDOM
-// =======================
+/* TEAM RANDOM */
 bot.hears("🎲 تیم‌کشی", (ctx) => {
   ctx.reply(
     "تعداد تیم‌ها رو انتخاب کن 👇",
@@ -46,15 +58,15 @@ bot.hears("🎲 تیم‌کشی", (ctx) => {
   );
 });
 
-bot.action(/team_(\d)/, (ctx) => {
+bot.action(/team_(\d)/, async (ctx) => {
+  await ctx.answerCbQuery();
   const count = ctx.match[1];
-  ctx.answerCbQuery();
-  ctx.reply(`✅ ${count} تیم انتخاب شد\n(منطق تیم‌کشی بعداً اضافه میشه)`);
+  ctx.reply(`✅ ${count} تیم انتخاب شد`);
 });
 
-// =======================
-// SAFE LAUNCH (NO 409)
-// =======================
+/* =========================
+   SAFE LAUNCH
+========================= */
 (async () => {
   try {
     await bot.telegram.deleteWebhook({ drop_pending_updates: true });
@@ -65,15 +77,13 @@ bot.action(/team_(\d)/, (ctx) => {
       }
     });
 
-    console.log("✅ Bot is running");
+    console.log("✅ Bot polling started");
   } catch (err) {
-    console.error("❌ Launch error:", err);
+    console.error("❌ Bot launch failed:", err);
     process.exit(1);
   }
 })();
 
-// =======================
-// SHUTDOWN
-// =======================
+/* SHUTDOWN */
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
