@@ -1,36 +1,27 @@
+import express from "express";
 import { Telegraf, Markup } from "telegraf";
 import dotenv from "dotenv";
-import express from "express";
 
 dotenv.config();
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
+const DOMAIN = process.env.DOMAIN; // آدرس Render
 
-if (!BOT_TOKEN) {
-  console.error("❌ BOT_TOKEN not found");
+if (!BOT_TOKEN || !DOMAIN) {
+  console.error("❌ BOT_TOKEN یا DOMAIN ست نشده");
   process.exit(1);
 }
 
-/* =========================
-   HTTP SERVER (FOR RENDER)
-========================= */
+const bot = new Telegraf(BOT_TOKEN);
 const app = express();
 
-app.get("/", (req, res) => {
-  res.send("🤖 Telegram bot is running");
-});
+app.use(express.json());
 
-app.listen(PORT, () => {
-  console.log(`🌐 HTTP server running on port ${PORT}`);
-});
+/* =====================
+   BOT COMMANDS
+===================== */
 
-/* =========================
-   TELEGRAM BOT
-========================= */
-const bot = new Telegraf(BOT_TOKEN);
-
-/* START */
 bot.start((ctx) => {
   ctx.reply(
     "🤖 ربات تیم‌کشی آماده است",
@@ -41,12 +32,10 @@ bot.start((ctx) => {
   );
 });
 
-/* HELP */
 bot.hears("ℹ️ راهنما", (ctx) => {
-  ctx.reply("📌 روی 🎲 تیم‌کشی بزن تا شروع کنیم");
+  ctx.reply("روی 🎲 تیم‌کشی بزن تا شروع کنیم");
 });
 
-/* TEAM RANDOM */
 bot.hears("🎲 تیم‌کشی", (ctx) => {
   ctx.reply(
     "تعداد تیم‌ها رو انتخاب کن 👇",
@@ -60,30 +49,32 @@ bot.hears("🎲 تیم‌کشی", (ctx) => {
 
 bot.action(/team_(\d)/, async (ctx) => {
   await ctx.answerCbQuery();
-  const count = ctx.match[1];
-  ctx.reply(`✅ ${count} تیم انتخاب شد`);
+  ctx.reply(`✅ ${ctx.match[1]} تیم انتخاب شد`);
 });
 
-/* =========================
-   SAFE LAUNCH
-========================= */
+/* =====================
+   WEBHOOK
+===================== */
+
+app.post("/telegram", (req, res) => {
+  bot.handleUpdate(req.body);
+  res.sendStatus(200);
+});
+
+app.get("/", (req, res) => {
+  res.send("🤖 Bot is alive");
+});
+
 (async () => {
   try {
-    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-
-    await bot.launch({
-      polling: {
-        timeout: 50
-      }
-    });
-
-    console.log("✅ Bot polling started");
+    await bot.telegram.deleteWebhook();
+    await bot.telegram.setWebhook(`${DOMAIN}/telegram`);
+    console.log("✅ Webhook set");
   } catch (err) {
-    console.error("❌ Bot launch failed:", err);
-    process.exit(1);
+    console.error("❌ Webhook error:", err);
   }
 })();
 
-/* SHUTDOWN */
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+app.listen(PORT, () => {
+  console.log(`🌐 Server running on ${PORT}`);
+});
