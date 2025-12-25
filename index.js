@@ -1,103 +1,114 @@
 const { Telegraf, Markup } = require("telegraf");
 
-const BOT_TOKEN = process.env.BOT_TOKEN || "TOKEN_BOT";
-const bot = new Telegraf(BOT_TOKEN);
+const bot = new Telegraf(process.env.BOT_TOKEN || "TOKEN_BOT");
 
-const games = {}; // ذخیره بازی‌ها بر اساس chatId
+const sessions = {}; // وضعیت هر چت
 
-// ================= START =================
+// ---------- START ----------
 bot.start((ctx) => {
+  sessions[ctx.chat.id] = {};
   ctx.reply(
-    "⚽ به بازی فوتبال خوش اومدی!\n\nچی کار می‌خوای بکنی؟",
+    "⚽ تیم‌کِشی فوتبال\n\nروش رو انتخاب کن:",
     Markup.inlineKeyboard([
-      [Markup.button.callback("🏟 شروع بازی فوتبال", "START_GAME")]
+      [Markup.button.callback("🤖 داخل ربات", "MODE_BOT")],
+      [Markup.button.callback("👥 داخل گروه", "MODE_GROUP")]
     ])
   );
 });
 
-// ================= START GAME =================
-bot.action("START_GAME", (ctx) => {
-  const chatId = ctx.chat.id;
-
-  games[chatId] = {
-    players: [],
-    shots: {},
-    started: false
-  };
-
+// ---------- MODE BOT ----------
+bot.action("MODE_BOT", (ctx) => {
+  sessions[ctx.chat.id] = { mode: "bot" };
   ctx.editMessageText(
-    "👥 بازیکن‌ها ثبت‌نام کنن:\n\nهر نفر فقط یک بار می‌تونه وارد بشه ⬇️",
+    "🔢 چند تیم می‌خوای؟",
     Markup.inlineKeyboard([
-      [Markup.button.callback("➕ ورود به بازی", "JOIN_GAME")],
-      [Markup.button.callback("⚽ شروع شوت‌زنی", "START_SHOTS")]
+      [Markup.button.callback("2️⃣ دو تیم", "BOT_TEAM_2")],
+      [Markup.button.callback("3️⃣ سه تیم", "BOT_TEAM_3")],
+      [Markup.button.callback("4️⃣ چهار تیم", "BOT_TEAM_4")]
     ])
   );
 });
 
-// ================= JOIN GAME =================
-bot.action("JOIN_GAME", (ctx) => {
-  const chatId = ctx.chat.id;
-  const user = ctx.from;
-  const game = games[chatId];
+// ---------- MODE GROUP ----------
+bot.action("MODE_GROUP", (ctx) => {
+  const botUsername = ctx.me;
+  ctx.editMessageText(
+    "👥 ربات رو به گروه اضافه کن:",
+    Markup.inlineKeyboard([
+      [
+        Markup.button.url(
+          "➕ افزودن به گروه",
+          `https://t.me/${botUsername}?startgroup=true`
+        )
+      ]
+    ])
+  );
+});
 
-  if (!game) {
-    return ctx.answerCbQuery("❌ بازی‌ای وجود نداره");
+// ---------- BOT TEAM COUNT ----------
+["2", "3", "4"].forEach((n) => {
+  bot.action(`BOT_TEAM_${n}`, (ctx) => {
+    sessions[ctx.chat.id].teamCount = Number(n);
+    sessions[ctx.chat.id].step = "names";
+    ctx.editMessageText(
+      "✍️ اسم‌ها رو بفرست (هر خط یک نفر)\n\n📌 به تعداد تیم‌ها اولی‌ها دروازه‌بان می‌شن"
+    );
+  });
+});
+
+// ---------- RECEIVE NAMES (BOT MODE) ----------
+bot.on("text", (ctx) => {
+  const s = sessions[ctx.chat.id];
+  if (!s || s.mode !== "bot" || s.step !== "names") return;
+
+  const names = ctx.message.text
+    .split("\n")
+    .map((n) => n.trim())
+    .filter(Boolean);
+
+  if (names.length < s.teamCount) {
+    return ctx.reply("❌ تعداد اسم‌ها کمتر از تعداد تیم‌هاست");
   }
 
-  if (game.players.find(p => p.id === user.id)) {
-    return ctx.answerCbQuery("❌ قبلاً وارد شدی");
+  const keepers = names.slice(0, s.teamCount);
+  const players = shuffle(names.slice(s.teamCount));
+
+  const teams = Array.from({ length: s.teamCount }, (_, i) => ({
+    name: `🔵 تیم ${i + 1}`,
+    gk: keepers[i],
+    players: [],
+    subs: []
+  }));
+
+  for (const p of players) {
+    const team = teams.reduce((a, b) =>
+      a.players.length < b.players.length ? a : b
+    );
+
+    if (team.players.length < 4) {
+      team.players.push(p);
+    } else {
+      team.subs.push(p);
+    }
   }
 
-  game.players.push({
-    id: user.id,
-    name: user.first_name
+  let result = "🏆 نتیجه تیم‌کِشی:\n\n";
+  teams.forEach((t) => {
+    result += `${t.name}\n`;
+    result += `🧤 دروازه‌بان: ${t.gk}\n`;
+    result += `👟 بازیکن‌ها: ${t.players.join("، ") || "—"}\n`;
+    result += `🔄 تعویضی‌ها: ${t.subs.join("، ") || "—"}\n\n`;
   });
 
-  ctx.answerCbQuery("✅ وارد بازی شدی");
+  ctx.reply(result);
+  delete sessions[ctx.chat.id];
 });
 
-// ================= START SHOTS =================
-bot.action("START_SHOTS", async (ctx) => {
-  const chatId = ctx.chat.id;
-  const game = games[chatId];
+// ---------- UTILS ----------
+function shuffle(arr) {
+  return arr.sort(() => Math.random() - 0.5);
+}
 
-  if (!game || game.players.length < 2) {
-    return ctx.answerCbQuery("❌ حداقل ۲ نفر لازمه");
-  }
-
-  if (game.started) {
-    return ctx.answerCbQuery("⏳ بازی قبلاً شروع شده");
-  }
-
-  game.started = true;
-  game.shots = {};
-
-  await ctx.editMessageText(
-    "⚽ شوت‌زنی شروع شد!\n\nهر بازیکن یک شوت می‌زنه..."
-  );
-
-  for (const player of game.players) {
-    const dice = await ctx.telegram.sendDice(chatId, { emoji: "⚽" });
-    game.shots[player.name] = dice.dice.value;
-  }
-
-  let result = "🏆 نتیجه بازی:\n\n";
-  for (const [name, value] of Object.entries(game.shots)) {
-    result += `⚽ ${name} → ${value}\n`;
-  }
-
-  await ctx.reply(result);
-});
-
-// ================= ERROR HANDLER =================
-bot.catch((err) => {
-  console.error("Bot Error:", err);
-});
-
-// ================= LAUNCH =================
+// ---------- SAFE ----------
+bot.catch(() => {});
 bot.launch();
-console.log("🤖 Bot is running with polling");
-
-// برای خاموش شدن امن
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
