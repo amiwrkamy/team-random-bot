@@ -1,422 +1,286 @@
-// index.js — Final fix: reshuffle bug (only this behavior fixed, rest intact)
-'use strict';
-
 const { Telegraf, Markup } = require('telegraf');
-const express = require('express');
-const Redis = require('ioredis');
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const REDIS_URL = process.env.REDIS_URL || '';
-const USE_WEBHOOK = (process.env.USE_WEBHOOK || 'false').toLowerCase() === 'true';
-const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
-const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
-
-if (!BOT_TOKEN) {
-  console.error('ERROR: BOT_TOKEN environment variable is required.');
+const TOKEN = process.env.BOT_TOKEN || 'YOUR_TOKEN_HERE';
+if (!TOKEN || TOKEN === 'YOUR_TOKEN_HERE') {
+  console.error('Please set BOT token in BOT_TOKEN env or replace YOUR_TOKEN_HERE');
   process.exit(1);
 }
 
-const bot = new Telegraf(BOT_TOKEN);
+const bot = new Telegraf(TOKEN);
 
-// Redis or fallback
-let redis;
-if (REDIS_URL) {
-  redis = new Redis(REDIS_URL);
-  redis.on('error', (e) => console.error('Redis error', e && e.message));
-  console.log('Using Redis:', REDIS_URL);
-} else {
-  console.warn('No REDIS_URL provided — using in-memory sessions (non-persistent).');
-  const mem = new Map();
-  redis = {
-    async get(k) { const v = mem.get(k); return v === undefined ? null : v; },
-    async set(k, v) { mem.set(k, v); return 'OK'; },
-    async del(k) { mem.delete(k); return 1; }
-  };
-}
+// ذخیرهٔ جلسات بازی‌ها بر اساس chat id
+// هر بازی ساختار:
+// {
+//   players: [{id, name}], 
+//   registration_message_id,
+//   registration_chat_id,
+//   is_shots_started: false,
+//   shots: {}
+// }
+const games = {};
 
-const SESSION_PREFIX = 'rtb:sess:';
-const sessionKey = (chatId) => `${SESSION_PREFIX}${chatId}`;
-
-async function loadSession(chatId) {
-  const raw = await redis.get(sessionKey(chatId));
-  if (!raw) return null;
-  try { return JSON.parse(raw); } catch (e) { console.error('parse session error', e); return null; }
-}
-async function saveSession(chatId, sess) {
-  await redis.set(sessionKey(chatId), JSON.stringify(sess));
-}
-
-function shuffle(a) {
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
-function escapeHtml(s) {
-  if (!s) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
-function createEmptyGroupSession(teamsCount, creator) {
-  const teams = Array.from({ length: teamsCount }, () => ({ members: [], subs: [] }));
-  return { type: 'group', teamsCount, teams, membersMap: {}, signupOpen: true, message_id: null, creator: creator || null };
-}
-
-function groupKeyboardReplyMarkup() {
+// کمک: می‌سازیم یک کیبوردِ ثبت نام با دکمه‌ها (JOIN, START_SHOTS, RESHUFFLE)
+function registrationKeyboard() {
   return Markup.inlineKeyboard([
-    [ Markup.button.callback('⚽ بازیکن', 'join:player'), Markup.button.callback('🥅 دروازه‌بان', 'join:gk') ],
-    [ Markup.button.callback('🔀 قاطی‌کردن دوباره (فقط ادمین)', 'action:reshuffle') ]
-  ]).reply_markup;
+    [Markup.button.callback('➕ ورود به بازی', 'JOIN_GAME')],
+    [Markup.button.callback('⚽ شروع شوت‌زنی', 'START_SHOTS')],
+    [Markup.button.callback('🔀 قاطی‌کردن دوباره (فقط ادمین)', 'RESHUFFLE')],
+  ]);
 }
 
-function buildGroupText(sess) {
-  let out = '<b>🏆 وضعیت تیم‌ها (لایو)</b>\n\n';
-  for (let i = 0; i < sess.teamsCount; i++) {
-    const t = sess.teams[i];
-    const color = ['🔵','🟢','🟠','🟣'][i % 4];
-    out += `${color} <b>تیم ${i+1}</b> — ${t.members.length} نفر\n`;
-    if (t.members.length === 0) out += '—\n';
-    else {
-      for (const m of t.members) {
-        const icon = (m.role === 'gk') ? '🧤' : '⚽';
-        out += `${icon} ${escapeHtml(m.name)}\n`;
-      }
-    }
-    if (t.subs && t.subs.length) {
-      out += `\n🔄 <b>تعویضی‌های تیم ${i+1}:</b>\n`;
-      for (const s of t.subs) out += `↳ ${escapeHtml(s.name)}\n`;
-    }
-    out += '\n';
-  }
-  out += '<b>📌 هر نفر فقط یک‌بار می‌تواند ثبت‌نام کند.</b>\n';
-  out += '<b>👑 فقط ادمین می‌تواند «🔀 قاطی‌کردن دوباره» را اجرا کند.</b>';
-  return out;
+function playersListText(players) {
+  if (!players || players.length === 0) return '— هیچ بازیکنی ثبت نشده.';
+  return players.map((p, idx) => `${idx + 1}. ${p.name}`).join('\n');
 }
 
-function assignPlayerToTeam(sess, userId, name) {
-  let minSize = Infinity;
-  for (let i = 0; i < sess.teamsCount; i++) {
-    const size = sess.teams[i].members.length;
-    if (size < minSize && size < 5) minSize = size;
-  }
-  const candidates = [];
-  for (let i = 0; i < sess.teamsCount; i++) {
-    if (sess.teams[i].members.length === minSize && sess.teams[i].members.length < 5) candidates.push(i);
-  }
-  if (candidates.length > 0) {
-    const pick = candidates[Math.floor(Math.random() * candidates.length)];
-    sess.teams[pick].members.push({ id: userId, name, role: 'player' });
-    sess.membersMap[String(userId)] = true;
-    return { placed: true, team: pick };
-  }
-  let minSubs = Infinity; let chosen = 0;
-  for (let i = 0; i < sess.teamsCount; i++) {
-    const s = sess.teams[i].subs.length;
-    if (s < minSubs) { minSubs = s; chosen = i; }
-  }
-  sess.teams[chosen].subs.push({ id: userId, name, role: 'player' });
-  sess.membersMap[String(userId)] = true;
-  return { placed: false, team: chosen };
-}
-
-function assignGkToTeam(sess, userId, name) {
-  const available = [];
-  for (let i = 0; i < sess.teamsCount; i++) {
-    const hasGK = sess.teams[i].members.some(m => m.role === 'gk');
-    if (!hasGK && sess.teams[i].members.length < 5) available.push(i);
-  }
-  if (available.length === 0) return null;
-  const pick = available[Math.floor(Math.random() * available.length)];
-  sess.teams[pick].members.push({ id: userId, name, role: 'gk' });
-  sess.membersMap[String(userId)] = true;
-  return { team: pick };
-}
-
-// === CRITICAL: reshuffle implementation (robust) ===
-function reshuffleSession(sess) {
-  // collect GK and players (all members + subs)
-  const gks = [];
-  const players = [];
-  for (let i = 0; i < sess.teamsCount; i++) {
-    for (const m of sess.teams[i].members) {
-      if (m.role === 'gk') gks.push({ id: m.id, name: m.name });
-      else players.push({ id: m.id, name: m.name });
-    }
-    for (const s of sess.teams[i].subs) players.push({ id: s.id, name: s.name });
-  }
-
-  // must have >= teamsCount GK to assign one per team
-  if (gks.length < sess.teamsCount) {
-    return { ok: false, reason: 'not_enough_gk' };
-  }
-
-  // shuffle arrays deeply
-  shuffle(gks);
-  shuffle(players);
-
-  // rebuild teams
-  const newTeams = Array.from({ length: sess.teamsCount }, () => ({ members: [], subs: [] }));
-
-  // assign one GK per team
-  for (let i = 0; i < sess.teamsCount; i++) {
-    const g = gks[i];
-    newTeams[i].members.push({ id: g.id, name: g.name, role: 'gk' });
-  }
-
-  // distribute players round-robin but respect max 5 (including GK)
-  let idx = 0;
-  for (const p of players) {
-    const teamIdx = idx % sess.teamsCount;
-    if (newTeams[teamIdx].members.length < 5) {
-      newTeams[teamIdx].members.push({ id: p.id, name: p.name, role: 'player' });
-    } else {
-      newTeams[teamIdx].subs.push({ id: p.id, name: p.name, role: 'player' });
-    }
-    idx++;
-  }
-
-  // replace session teams
-  sess.teams = newTeams;
-  // membersMap stays same (we keep same user ids)
-  return { ok: true };
-}
-
-async function updateGroupMessage(chatId, sess) {
-  const text = buildGroupText(sess);
-  const reply_markup = groupKeyboardReplyMarkup();
-  try {
-    if (sess.message_id) {
-      // try edit
-      await bot.telegram.editMessageText(chatId, sess.message_id, null, text, { parse_mode: 'HTML', reply_markup });
-    } else {
-      const sent = await bot.telegram.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup });
-      sess.message_id = sent.message_id;
-    }
-  } catch (err) {
-    // If edit failed (deleted message or can't edit), send new and update message_id
-    console.warn('editMessageText failed, sending new message. err:', err && err.message);
-    const sent = await bot.telegram.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup });
-    sess.message_id = sent.message_id;
-  }
-  await saveSession(chatId, sess);
-}
-
-// ---------- Bot handlers (same as before, only reshuffle flow ensured robust) ----------
-
+// استارت
 bot.start(async (ctx) => {
-  const chat = ctx.chat;
-  if (chat.type === 'private') {
-    await ctx.reply('سلام! کجا می‌خوای تیم‌چینی انجام بشه؟', Markup.inlineKeyboard([
-      [ Markup.button.callback('🤖 داخل ربات', 'mode:inside_bot') ],
-      [ Markup.button.callback('👥 داخل گروه', 'mode:inside_group') ]
-    ]));
-  } else {
-    await ctx.reply('برای شروع تیم‌چینی ادمین گروه دستور /start_team را اجرا کند.');
+  try {
+    await ctx.reply(
+      "⚽ به بازی فوتبال خوش اومدی!\n\nچی کار می‌خوای بکنی؟",
+      Markup.inlineKeyboard([[Markup.button.callback('🏟 شروع بازی فوتبال', 'START_GAME')]])
+    );
+  } catch (e) {
+    console.error('start error', e);
   }
 });
 
-bot.command('start_team', async (ctx) => {
-  if (ctx.chat.type === 'private') return ctx.reply('این دستور فقط در گروه اجرا می‌شود.');
+// START_GAME: پیام ثبت نام در گروه یا پیوی
+bot.action('START_GAME', async (ctx) => {
   try {
-    const admins = await ctx.getChatAdministrators();
-    if (!admins.some(a => a.user.id === ctx.from.id)) return ctx.reply('⛔ فقط ادمین می‌تواند این دستور را اجرا کند.');
-  } catch (e) { console.error('admin check error', e); }
-  await ctx.reply('🔢 چند تیم می‌خواهی؟', Markup.inlineKeyboard([
-    [ Markup.button.callback('2️⃣  2 تیم', 'teams:2'), Markup.button.callback('3️⃣  3 تیم', 'teams:3') ],
-    [ Markup.button.callback('4️⃣  4 تیم', 'teams:4') ]
-  ]));
-});
+    const chatId = ctx.chat.id;
+    // initialize game object
+    games[chatId] = {
+      players: [],
+      registration_message_id: null,
+      registration_chat_id: chatId,
+      is_shots_started: false,
+      shots: {}
+    };
 
-bot.on('callback_query', async (ctx) => {
-  const data = ctx.callbackQuery && ctx.callbackQuery.data;
-  const from = ctx.from;
-  const message = ctx.callbackQuery && ctx.callbackQuery.message;
-  try {
-    if (data === 'mode:inside_bot') {
-      await ctx.answerCbQuery();
-      return ctx.reply('در حالت داخل ربات — چند تیم؟', Markup.inlineKeyboard([
-        [ Markup.button.callback('2️⃣  2 تیم', 'private:teams:2') ],
-        [ Markup.button.callback('3️⃣  3 تیم', 'private:teams:3') ],
-        [ Markup.button.callback('4️⃣  4 تیم', 'private:teams:4') ]
-      ]));
-    }
-    if (data === 'mode:inside_group') {
-      await ctx.answerCbQuery();
-      const me = await bot.telegram.getMe();
-      const url = `https://t.me/${me.username}?startgroup=true`;
-      return ctx.replyWithHTML(`برای اضافه کردن ربات به گروه از لینک زیر استفاده کنید:\n<a href="${url}">اضافه کردن ربات به گروه</a>`);
-    }
-
-    if (data && data.startsWith('private:teams:')) {
-      await ctx.answerCbQuery();
-      const num = Number(data.split(':').pop());
-      const sess = { type: 'private', teamsCount: num, awaitingNames: true, creator: from.id };
-      await saveSession(ctx.chat.id, sess);
-      return ctx.reply(`<b>حالت داخل ربات — تعداد تیم‌ها: ${num}</b>\n\nلطفاً اسامی را هر کدام در یک خط ارسال کنید.\nتوجه: ${num} نام اول به عنوان دروازه‌بان در نظر گرفته می‌شوند.`, { parse_mode: 'HTML' });
-    }
-
-    if (data && data.startsWith('teams:')) {
-      await ctx.answerCbQuery();
-      const num = Number(data.split(':').pop());
-      const chatId = message.chat.id;
-      try {
-        const admins = await bot.telegram.getChatAdministrators(chatId);
-        if (!admins.some(a => a.user.id === from.id)) {
-          return ctx.reply('⛔ فقط ادمین می‌تواند تعداد تیم‌ها را انتخاب کند.');
-        }
-      } catch (e) { console.error('admin check error', e); }
-      const sess = createEmptyGroupSession(num, from.id);
-      await saveSession(chatId, sess);
-      await updateGroupMessage(chatId, sess);
-      return;
-    }
-
-    if (data === 'join:player') {
-      await ctx.answerCbQuery();
-      const chatId = message.chat.id;
-      const sess = await loadSession(chatId);
-      if (!sess || !sess.signupOpen) return ctx.answerCbQuery('ثبت‌نام فعالی وجود ندارد.', { show_alert: true });
-      if (sess.membersMap && sess.membersMap[String(from.id)]) return ctx.answerCbQuery('شما قبلاً ثبت‌نام کرده‌اید.', { show_alert: true });
-      const name = from.username ? `@${from.username}` : (from.first_name || `${from.id}`);
-      const res = assignPlayerToTeam(sess, from.id, name);
-      await saveSession(chatId, sess);
-      await updateGroupMessage(chatId, sess);
-      if (res.placed) return ctx.answerCbQuery(`✅ شما در تیم ${res.team + 1} ثبت شدید.`);
-      else return ctx.answerCbQuery(`✅ شما به تعویضی تیم ${res.team + 1} اضافه شدید.`);
-    }
-
-    if (data === 'join:gk') {
-      await ctx.answerCbQuery();
-      const chatId = message.chat.id;
-      const sess = await loadSession(chatId);
-      if (!sess || !sess.signupOpen) return ctx.answerCbQuery('ثبت‌نام فعالی وجود ندارد.', { show_alert: true });
-      if (sess.membersMap && sess.membersMap[String(from.id)]) return ctx.answerCbQuery('شما قبلاً ثبت‌نام کرده‌اید.', { show_alert: true });
-      const name = from.username ? `@${from.username}` : (from.first_name || `${from.id}`);
-      const res = assignGkToTeam(sess, from.id, name);
-      if (!res) {
-        await saveSession(chatId, sess);
-        await updateGroupMessage(chatId, sess);
-        return ctx.answerCbQuery('تعداد دروازه‌بان‌ها تکمیل شده یا تیم مناسب وجود ندارد.', { show_alert: true });
-      }
-      await saveSession(chatId, sess);
-      await updateGroupMessage(chatId, sess);
-      return ctx.answerCbQuery(`✅ شما دروازه‌بان تیم ${res.team + 1} شدید.`);
-    }
-
-    // === FIXED: reshuffle flow ===
-    if (data === 'action:reshuffle') {
-      await ctx.answerCbQuery();
-      const chatId = message.chat.id;
-      const sess = await loadSession(chatId);
-      if (!sess) return ctx.answerCbQuery();
-      // admin check
-      try {
-        const admins = await bot.telegram.getChatAdministrators(chatId);
-        if (!admins.some(a => a.user.id === from.id)) {
-          return ctx.answerCbQuery('⚠️ فقط ادمین می‌تواند این کار را انجام دهد.', { show_alert: true });
-        }
-      } catch (e) { console.error('admin check error', e); }
-      // perform reshuffle
-      const result = reshuffleSession(sess);
-      if (!result.ok) {
-        // not enough GKs — do not change anything, inform admin and update message (keeps existing layout)
-        await saveSession(chatId, sess);
-        await updateGroupMessage(chatId, sess);
-        return ctx.answerCbQuery('⚠️ قاطی‌کردن دوباره ممکن نیست — تعداد دروازه‌بان‌ها کافی نیست.', { show_alert: true });
-      }
-      // reshuffle succeeded — update session & message (edit)
-      await saveSession(chatId, sess);
-      await updateGroupMessage(chatId, sess); // this will attempt edit; if edit fails it will send new message and update message_id
-      return ctx.answerCbQuery('🔀 بازچینش انجام شد.');
+    // edit original message (if possible) or reply
+    const text = `👥 ثبت‌نام برای بازی شروع شد!\n\nهر کسی می‌خواهد شرکت کند روی «➕ ورود به بازی» بزند.\n\n📋 لیست فعلی:\n${playersListText(games[chatId].players)}\n\n📌 نکته: فقط یک‌بار می‌توانید ثبت‌نام کنید.`;
+    // Try to edit the callback message (so it shows inline keyboard under same message)
+    const msg = ctx.update.callback_query && ctx.update.callback_query.message;
+    if (msg && msg.message_id) {
+      const sent = await ctx.editMessageText(text, {
+        reply_markup: registrationKeyboard().reply_markup
+      });
+      // save registration message id
+      games[chatId].registration_message_id = msg.message_id;
+    } else {
+      const sent = await ctx.reply(text, registrationKeyboard());
+      games[chatId].registration_message_id = sent.message_id;
     }
 
     await ctx.answerCbQuery();
   } catch (err) {
-    console.error('callback_query error', err && err.message);
-    try { await ctx.answerCbQuery('❌ خطا — دوباره تلاش کنید', { show_alert: true }); } catch(e){}
+    console.error('START_GAME error', err);
+    try { await ctx.answerCbQuery('خطا رخ داد.'); } catch(e){}
   }
 });
 
-bot.on('message', async (ctx) => {
+// JOIN_GAME: ثبت نام بازیکن
+bot.action('JOIN_GAME', async (ctx) => {
   try {
-    const chat = ctx.chat;
-    if (chat.type !== 'private') return;
-    const sess = await loadSession(chat.id);
-    if (!sess || sess.type !== 'private' || !sess.awaitingNames) return;
-    const text = (ctx.message.text || '').trim();
-    if (!text) return ctx.reply('لطفاً اسامی را هر کدام در یک خط ارسال کنید.');
-    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-    const teamsCount = sess.teamsCount;
-    if (lines.length < teamsCount) {
-      return ctx.reply(`لطفاً حداقل ${teamsCount} نام ارسال کنید — ${teamsCount} نام اول به عنوان دروازه‌بان در نظر گرفته می‌شوند.`);
+    const chatId = ctx.chat.id;
+    const user = ctx.from;
+    const game = games[chatId];
+    if (!game) {
+      await ctx.answerCbQuery('جلسه‌ای باز نیست. ابتدا "شروع بازی" را بزنید.', { show_alert: true });
+      return;
     }
-    const gkNames = lines.slice(0, teamsCount);
-    const playerNames = lines.slice(teamsCount);
-    shuffle(gkNames);
-    shuffle(playerNames);
-    const teams = Array.from({ length: teamsCount }, () => ({ members: [], subs: [] }));
-    for (let i = 0; i < teamsCount; i++) teams[i].members.push({ id: null, name: gkNames[i], role: 'gk' });
-    let idx = 0;
-    for (const pname of playerNames) {
-      const tIdx = idx % teamsCount;
-      if (teams[tIdx].members.length < 5) teams[tIdx].members.push({ id: null, name: pname, role: 'player' });
-      else teams[tIdx].subs.push({ id: null, name: pname, role: 'player' });
-      idx++;
+    if (game.is_shots_started) {
+      await ctx.answerCbQuery('ثبت‌نام بسته شده؛ بازی شروع شده.', { show_alert: true });
+      return;
     }
-    let out = '<b>🏆 نتیجهٔ داخل ربات (شانسی)</b>\n\n';
-    for (let i = 0; i < teamsCount; i++) {
-      out += `<b>🔹 تیم ${i + 1} — ${teams[i].members.length} نفر</b>\n`;
-      for (const m of teams[i].members) out += `${m.role === 'gk' ? '🧤' : '⚽'} ${escapeHtml(m.name)}\n`;
-      if (teams[i].subs.length) {
-        out += `<b>🔄 تعویضی‌های تیم ${i + 1}:</b>\n`;
-        for (const s of teams[i].subs) out += `↳ ${escapeHtml(s.name)}\n`;
+    if (game.players.some(p => p.id === user.id)) {
+      await ctx.answerCbQuery('❌ شما قبلاً ثبت‌نام کرده‌اید.', { show_alert: true });
+      return;
+    }
+
+    // ثبت بازیکن
+    const name = user.username ? `@${user.username}` : (user.first_name || 'ناشناس');
+    game.players.push({ id: user.id, name });
+
+    // آپدیت پیام ثبت‌نام (ویرایش پیام قبلی) — اینجا مهمه: پیام قبلی باید ذخیره شده باشه
+    const regMsgId = game.registration_message_id;
+    const regChatId = game.registration_chat_id || chatId;
+    const newText = `👥 ثبت‌نام برای بازی ادامه دارد!\n\nهر کسی می‌خواهد شرکت کند روی «➕ ورود به بازی» بزند.\n\n📋 لیست فعلی:\n${playersListText(game.players)}\n\n📌 نکته: فقط یک‌بار می‌توانید ثبت‌نام کنید.`;
+    try {
+      if (regMsgId) {
+        await ctx.telegram.editMessageText(regChatId, regMsgId, null, newText, {
+          reply_markup: registrationKeyboard().reply_markup
+        });
+      } else {
+        // fallback – send new message and save id
+        const sent = await ctx.reply(newText, registrationKeyboard());
+        game.registration_message_id = sent.message_id;
+        game.registration_chat_id = sent.chat.id;
       }
-      out += '\n';
+    } catch (editErr) {
+      // اگر edit نشد، فِیل‌بک: ارسال پیام جدید ولی اعلام می‌کنیم
+      console.warn('edit failed in JOIN_GAME:', editErr);
+      const sent = await ctx.reply(newText, registrationKeyboard());
+      game.registration_message_id = sent.message_id;
+      game.registration_chat_id = sent.chat.id;
     }
-    await ctx.reply(out, { parse_mode: 'HTML' });
-    sess.awaitingNames = false;
-    await saveSession(chat.id, sess);
+
+    await ctx.answerCbQuery('✅ شما به بازی اضافه شدید.');
   } catch (err) {
-    console.error('private message handler error', err && err.message);
+    console.error('JOIN_GAME error', err);
+    try { await ctx.answerCbQuery('خطا در ثبت‌نام.'); } catch(e){}
   }
 });
 
-(async function startBot() {
+// START_SHOTS: اجرای بازی (اینجا شبیه نمونهٔ تو — هر بازیکن یک dice می‌زند)
+bot.action('START_SHOTS', async (ctx) => {
   try {
-    if (USE_WEBHOOK && WEBHOOK_URL) {
-      const app = express();
-      app.use(express.json());
-      app.get('/healthz', (req, res) => res.send('OK'));
-      app.post('/telegram-webhook', (req, res) => {
-        bot.handleUpdate(req.body).then(() => res.status(200).end()).catch((e) => { console.error('handleUpdate error', e); res.status(500).end(); });
-      });
-      app.listen(PORT, async () => {
-        console.log(`Express listening on ${PORT}, setting webhook to ${WEBHOOK_URL}`);
-        try { await bot.telegram.setWebhook(WEBHOOK_URL); console.log('Webhook set.'); } catch (e) { console.error('setWebhook error', e && e.message); }
-      });
-    } else {
-      try { await bot.telegram.deleteWebhook(); console.log('Deleted webhook (if any). Starting polling.'); } catch (e) { console.warn('deleteWebhook warning', e && e.message); }
-      await bot.launch();
-      console.log('Bot started with long polling.');
+    const chatId = ctx.chat.id;
+    const game = games[chatId];
+    if (!game) {
+      await ctx.answerCbQuery('جلسه‌ای باز نیست. ابتدا "شروع بازی" را بزنید.', { show_alert: true });
+      return;
+    }
+    if (game.players.length < 2) {
+      await ctx.answerCbQuery('❌ حداقل ۲ نفر نیاز است.', { show_alert: true });
+      return;
+    }
+    // علامت گذاری که ثبت نام بسته شد
+    game.is_shots_started = true;
+
+    // ویرایش پیام ثبت نام تا اعلام شروع شود
+    const regMsgId = game.registration_message_id;
+    const regChatId = game.registration_chat_id || chatId;
+    try {
+      if (regMsgId) {
+        await ctx.telegram.editMessageText(regChatId, regMsgId, null, '⚽ شوت‌زنی شروع شد!\nهر بازیکن یک شوت می‌زنه...', {
+          reply_markup: registrationKeyboard().reply_markup
+        });
+      } else {
+        await ctx.reply('⚽ شوت‌زنی شروع شد!\nهر بازیکن یک شوت می‌زنه...');
+      }
+    } catch (e) {
+      console.warn('edit failed in START_SHOTS:', e);
+      await ctx.reply('⚽ شوت‌زنی شروع شد!\nهر بازیکن یک شوت می‌زنه...');
     }
 
-    process.once('SIGINT', () => { bot.stop('SIGINT'); process.exit(0); });
-    process.once('SIGTERM', () => { bot.stop('SIGTERM'); process.exit(0); });
-  } catch (e) {
-    console.error('startBot error', e && e.message);
-    try { await bot.launch(); console.log('Fallback: bot launched with polling'); } catch(err) { console.error('Fallback failed', err); process.exit(1); }
+    // هر بازیکن یک dice می‌فرستیم و نتیجه را ذخیره می‌کنیم
+    game.shots = {};
+    for (const player of game.players) {
+      // sendDice returns a message with dice
+      const diceMsg = await ctx.telegram.sendDice(chatId, { emoji: '⚽' });
+      // بعضی مواقع dice.dice may be available as diceMsg.dice
+      const val = diceMsg?.dice?.value ?? Math.floor(Math.random() * 6) + 1;
+      game.shots[player.name] = val;
+      // هر بار کوتاه یه تیکه پیام بفرست (اختیاری) — اینجا نمی‌فرستیم اضافی تا flood نشه
+    }
+
+    // نتیجه نهایی
+    let result = '🏆 نتیجه بازی:\n\n';
+    for (const [name, value] of Object.entries(game.shots)) {
+      result += `⚽ ${name} → ${value}\n`;
+    }
+    await ctx.reply(result);
+    await ctx.answerCbQuery();
+  } catch (err) {
+    console.error('START_SHOTS error', err);
+    try { await ctx.answerCbQuery('خطا در شروع بازی.'); } catch(e){}
+  }
+});
+
+// RESHUFFLE: فقط ادمین می‌تواند — باید لیست بازیکنان را شانسی دوباره مرتب کند و پیام ثبت‌نام را ویرایش کند (edit)
+bot.action('RESHUFFLE', async (ctx) => {
+  try {
+    const chatId = ctx.chat.id;
+    const user = ctx.from;
+    const game = games[chatId];
+    if (!game) {
+      await ctx.answerCbQuery('جلسه‌ای باز نیست.', { show_alert: true });
+      return;
+    }
+
+    // بررسی ادمین بودن کاربر در گروه — اگر در چت خصوصی است، خود کاربر را ادمین فرض نمی‌کنیم
+    let isAdmin = false;
+    try {
+      const admins = await ctx.getChatAdministrators();
+      isAdmin = admins.some(a => a.user && a.user.id === user.id);
+    } catch (err) {
+      // اگر خطا شد (مثلاً در چت خصوصی) — همچنان اجازه نمی‌دهیم مگر اینکه در گپ نباشد.
+      console.warn('getChatAdministrators failed:', err);
+    }
+
+    if (!isAdmin) {
+      await ctx.answerCbQuery('⚠️ فقط ادمین گروه می‌تواند قاطی کند.', { show_alert: true });
+      return;
+    }
+
+    if (!game.players || game.players.length === 0) {
+      await ctx.answerCbQuery('هیچ بازیکنی وجود ندارد که قاطی شود.', { show_alert: true });
+      return;
+    }
+
+    // shuffle players array (Fisher-Yates)
+    for (let i = game.players.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [game.players[i], game.players[j]] = [game.players[j], game.players[i]];
+    }
+
+    // سپس پیام ثبت‌نام را ویرایش کن (editMessageText) — همین‌جا باید پیام id ذخیره شده باشد
+    const regMsgId = game.registration_message_id;
+    const regChatId = game.registration_chat_id || chatId;
+
+    const newText = `🔀 قاطی شد! (فقط ادمین اجرا کرد)\n\n📋 لیست جدید بازیکنان:\n${playersListText(game.players)}\n\n📌 نکته: فقط یک‌بار می‌توانید ثبت‌نام کنید.`;
+
+    try {
+      if (regMsgId) {
+        await ctx.telegram.editMessageText(regChatId, regMsgId, null, newText, {
+          reply_markup: registrationKeyboard().reply_markup
+        });
+        // پاسخ به کلید فشرده شده (بدون alert)
+        await ctx.answerCbQuery('🔀 بازیکنان قاطی شدند و پیام ویرایش شد.');
+      } else {
+        // fallback — اگر بدون msgId باشه، ارسال پیام جدید ولی ذخیره id
+        const sent = await ctx.reply(newText, registrationKeyboard());
+        game.registration_message_id = sent.message_id;
+        game.registration_chat_id = sent.chat.id;
+        await ctx.answerCbQuery('🔀 بازیکنان قاطی شدند (پیام جدید ارسال شد).');
+      }
+    } catch (editErr) {
+      console.error('RESHUFFLE edit failed:', editErr);
+      // اگر ویرایش نتونست انجام شه، سعی می‌کنیم حداقل پیام رو به‌روزرسانی کنیم با reply و اطلاع
+      try {
+        const sent = await ctx.reply(newText, registrationKeyboard());
+        game.registration_message_id = sent.message_id;
+        game.registration_chat_id = sent.chat.id;
+        await ctx.answerCbQuery('🔀 بازیکنان قاطی شدند (fallback پیام جدید ارسال شد).');
+      } catch (sendErr) {
+        console.error('RESHUFFLE fallback send failed:', sendErr);
+        await ctx.answerCbQuery('خطا در قاطی کردن — لطفاً بعداً تلاش کنید.', { show_alert: true });
+      }
+    }
+
+  } catch (err) {
+    console.error('RESHUFFLE error:', err);
+    try { await ctx.answerCbQuery('خطا در عملیات قاطی کردن.'); } catch(e){}
+  }
+});
+
+// خطاها را لاگ کن
+bot.catch((err) => {
+  console.error('Bot error', err);
+});
+
+// اجرای بات (polling)
+(async () => {
+  try {
+    await bot.launch();
+    console.log('Bot launched');
+  } catch (err) {
+    console.error('Failed to launch bot', err);
   }
 })();
 
-// global errors
-process.on('uncaughtException', (err) => {
-  console.error('uncaughtException', err && err.stack || err);
-  process.exit(1); // let host restart; sessions persist if Redis used
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('unhandledRejection', reason);
-});
-
-// export for testing
-module.exports = { bot, redis };
+// graceful stop
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
