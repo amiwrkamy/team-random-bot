@@ -1,8 +1,9 @@
+import os
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from backend import shuffle_teams
 
-TOKEN = "PUT_YOUR_BOT_TOKEN"
+TOKEN = os.getenv("TOKEN")  # توکن از Render ENV
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
@@ -43,7 +44,7 @@ def admin_keyboard():
 @dp.message_handler(commands=["start"])
 async def start(msg: types.Message):
     await msg.answer(
-        "🎲 قرعه‌کشی تیم‌ها\nانتخاب کن:",
+        "🎲 قرعه‌کشی شانسی تیم‌ها\nانتخاب کن:",
         reply_markup=start_keyboard()
     )
 
@@ -113,7 +114,7 @@ async def draw_private(msg: types.Message):
 async def group_link(call: types.CallbackQuery):
     me = await bot.get_me()
     await call.message.answer(
-        "🔗 لینک افزودن به گروه:\n"
+        "🔗 افزودن بات به گروه:\n"
         f"https://t.me/{me.username}?startgroup=true"
     )
 
