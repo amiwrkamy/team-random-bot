@@ -1,7 +1,6 @@
 {
-  "name": "football-telegram-bot",
+  "name": "football-team-draw-bot",
   "version": "1.0.0",
-  "description": "Simple Football Game Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
