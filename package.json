@@ -1,7 +1,7 @@
 {
   "name": "random-team-bot",
-  "version": "1.0.0",
-  "description": "Random team picker bot (group & private) with Redis sessions and webhook/polling auto-detect",
+  "version": "1.0.1",
+  "description": "Random team picker bot (robust) with webhook/polling/backoff",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
