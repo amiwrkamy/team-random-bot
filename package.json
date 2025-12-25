@@ -1,7 +1,6 @@
 {
   "name": "telegram-team-bot",
   "version": "1.0.0",
-  "description": "Random Team Bot",
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -9,6 +8,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.5",
+    "express": "^4.19.2",
     "telegraf": "^4.16.3"
   }
 }
